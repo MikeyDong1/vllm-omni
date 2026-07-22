@@ -85,7 +85,7 @@ a pure table (`stage_roles.resolve_execution_path`), mirrored in
 
 ### State vs payload
 
-`StepRequestState` (`vllm_omni/diffusion/worker/utils.py`) is **mutable
+`DiffusionRequestState` (`vllm_omni/diffusion/worker/utils.py`) is **mutable
 runner-local state** and never crosses a process boundary. Inter-stage data
 travels as a typed, versioned `StagePayload`
 (`vllm_omni/diffusion/models/interface.py`, transport helpers in
@@ -121,22 +121,33 @@ scattered through model code.
 
 ### Pipeline capability protocol
 
-`vllm_omni/diffusion/models/interface.py` adds `SupportsDisaggregatedExecution`
-(runtime-checkable), separate from `SupportsStepExecution` — a whole-request
-denoise loop with model-owned session/KV (e.g. DreamZero's dual video+action
-DiT loop) cannot be expressed as the single-tensor `denoise_step` /
-`step_scheduler` step contract. A pipeline may implement either, both, or
-neither. The protocol declares:
+`vllm_omni/diffusion/models/interface.py` follows PR #4948 and exposes a single
+runtime-checkable `DiffusionV2Atoms` protocol that carries **both** the
+whole-request atoms and the per-step atoms. Disaggregated stage execution is a
+use of that same surface, gated by an explicit
+`supports_disaggregated_execution` `ClassVar[bool]` flag plus the RFC #4590
+`required_components_for_stage` extension. A whole-request denoise loop with
+model-owned session/KV (e.g. DreamZero's dual video+action DiT loop) cannot be
+driven by the single-tensor `denoise_step` / `step_scheduler` step path, so
+DreamZero sets `supports_step_execution = False` (its four step atoms are
+present but raise) while still implementing the whole-request atoms. The
+protocol declares:
 
 * the whole-request atoms `init_state`, `check_inputs`, `encode`, `prepare`,
   `diffuse`, `decode`, `postprocess`;
+* the per-step atoms `build_step_batch`, `build_step_attention_metadata`,
+  `denoise_step`, `step_scheduler` (used by the step runner
+  `DiffusionModelRunnerV2`; default implementations live in
+  `vllm_omni/diffusion/models/step_mixin.py`);
 * `pack_stage_state` / `unpack_stage_state` — pack/apply a `StagePayload` at a
   stage boundary without exposing model-private schema to the runner;
 * `required_components_for_stage(model_stage)` — declares which components a
   given stage role must build;
 * the `supports_disaggregated_execution` `ClassVar[bool]` flag.
   `supports_disaggregated_execution(pipeline)` is the capability helper,
-  paralleling the existing `supports_step_execution(pipeline)`.
+  paralleling `supports_step_execution(pipeline)` (which accepts either the
+  `DiffusionV2Atoms` surface or the legacy `SupportsStepExecution` contract kept
+  for pipelines not yet migrated).
 
 A stage that requests `encode`/`denoise`/`decode` on a pipeline lacking the
 disaggregated capability fails at **startup** (`load_model`), not mid-forward.
@@ -252,7 +263,7 @@ existing math helpers. `forward()` now composes all three on one carrier and one
 session state — so the monolithic golden path and the disaggregated path run the
 **same** code, making numerical equivalence structural rather than coincidental.
 The DreamZero-private inter-phase carrier (`DreamZeroStageCarrier`) lives on
-`StepRequestState.extra` (model-private), never on the generic state fields.
+`DiffusionRequestState.extra` (model-private), never on the generic state fields.
 
 ## Multi-chunk session progress (RFC §A)
 

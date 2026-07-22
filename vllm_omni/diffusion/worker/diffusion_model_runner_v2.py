@@ -87,38 +87,45 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
 
         resolved: list[DiffusionRequestState] = []
         new_request_ids: list[str] = []
-        for sched_new_req in scheduler_output.scheduled_new_reqs:
-            request_id = sched_new_req.request_id
-            new_request_ids.append(request_id)
-            if request_id in self.state_cache:
-                raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
-            req = sched_new_req.req
-            sampling = copy.deepcopy(req.sampling_params)
-            new_state = DiffusionRequestState(
-                request_id=request_id,
-                sampling=sampling,
-                prompt=getattr(req, "prompt", None),
-                kv_sender_info=getattr(req, "kv_sender_info", None),
-            )
-            state_req = _StepRequestView(
-                request_id=request_id,
-                prompt=new_state.prompt,
-                sampling_params=sampling,
-                kv_sender_info=new_state.kv_sender_info,
-            )
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                state_req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=self._target_device,
-            )
-            self.state_cache[request_id] = new_state
-            resolved.append(new_state)
+        try:
+            for sched_new_req in scheduler_output.scheduled_new_reqs:
+                request_id = sched_new_req.request_id
+                new_request_ids.append(request_id)
+                if request_id in self.state_cache:
+                    raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
+                req = sched_new_req.req
+                sampling = copy.deepcopy(req.sampling_params)
+                new_state = DiffusionRequestState(
+                    request_id=request_id,
+                    sampling=sampling,
+                    prompt=getattr(req, "prompt", None),
+                    kv_sender_info=getattr(req, "kv_sender_info", None),
+                )
+                state_req = _StepRequestView(
+                    request_id=request_id,
+                    prompt=new_state.prompt,
+                    sampling_params=sampling,
+                    kv_sender_info=new_state.kv_sender_info,
+                )
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    state_req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=self._target_device,
+                )
+                self.state_cache[request_id] = new_state
+                resolved.append(new_state)
 
-        for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
-            state = self.state_cache.get(request_id)
-            if state is None:
-                raise ValueError(f"Missing cached state for request {request_id}.")
-            resolved.append(state)
+            for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
+                state = self.state_cache.get(request_id)
+                if state is None:
+                    raise ValueError(f"Missing cached state for request {request_id}.")
+                resolved.append(state)
+        except Exception:
+            # Match the base runner: don't leak partially-inserted new states
+            # into the cache if setup throws mid-loop.
+            for request_id in new_request_ids:
+                self.state_cache.pop(request_id, None)
+            raise
 
         return resolved, new_request_ids
 

@@ -62,7 +62,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
     BatchRunnerOutput,
     RunnerOutput,
-    StepRequestState,
+    DiffusionRequestState,
     attach_stage_durations,
     clear_pipeline_stage_durations,
     consume_pipeline_stage_durations,
@@ -146,7 +146,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.input_batch: InputBatch | None = None
 
         # Cache for per-request stepwise state.
-        self.state_cache: dict[str, StepRequestState] = {}
+        self.state_cache: dict[str, DiffusionRequestState] = {}
 
         # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -276,8 +276,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
-                "step_execution=True requires a pipeline implementing "
-                "DiffusionV2Atoms; "
+                "step_execution=True requires a pipeline implementing the DiffusionV2Atoms "
+                "step atoms or the legacy SupportsStepExecution contract; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
@@ -575,7 +575,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def _attach_stepwise_metrics(
         self,
-        state: StepRequestState,
+        state: DiffusionRequestState,
         output: DiffusionOutput,
     ) -> None:
         merge_stage_durations(
@@ -687,9 +687,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         return torch.no_grad() if use_hsdp else torch.inference_mode()
 
-    def _create_state_from_request(self, req: OmniDiffusionRequest) -> StepRequestState:
+    def _create_state_from_request(self, req: OmniDiffusionRequest) -> DiffusionRequestState:
         """Build a fresh runner-local state from a raw request (encode stage)."""
-        state = StepRequestState(
+        state = DiffusionRequestState(
             request_id=req.request_id,
             sampling=copy.deepcopy(req.sampling_params),
             prompt=req.prompt,
@@ -748,7 +748,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def _intermediate_output(
         self,
-        state: StepRequestState,
+        state: DiffusionRequestState,
         payload: StagePayload,
     ) -> DiffusionOutput:
         """Wrap an exported payload as an intermediate (non-final) stage output.
@@ -922,12 +922,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[DiffusionRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(request_id, None)
 
-        resolved: list[StepRequestState] = []
+        resolved: list[DiffusionRequestState] = []
         new_request_ids: list[str] = []
         try:
             # process new requests
@@ -936,7 +936,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 new_request_ids.append(request_id)
                 if request_id in self.state_cache:
                     raise ValueError(f"Received duplicate new-request payload for cached request {request_id}.")
-                new_state = StepRequestState(
+                new_state = DiffusionRequestState(
                     request_id=request_id,
                     sampling=copy.deepcopy(sched_new_req.req.sampling_params),
                     prompt=sched_new_req.req.prompt,
@@ -965,7 +965,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return resolved, new_request_ids
 
-    def _prepare_batch_inputs(self, states: list[StepRequestState], new_request_ids: list[str]) -> InputBatch:
+    def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
         # process new reqs
         for state in states:
             if state.request_id in new_request_ids:
@@ -987,7 +987,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def _update_states_after(
         self,
-        states: list[StepRequestState],
+        states: list[DiffusionRequestState],
         input_batch: InputBatch,
         interrupted: bool = False,
     ) -> None:

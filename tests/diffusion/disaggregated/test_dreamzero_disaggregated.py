@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DreamZero disaggregated-execution tests (#4948 SupportsDisaggregatedExecution).
+"""DreamZero disaggregated-execution tests (#4948 DiffusionV2Atoms).
 
 Tiers, all ``needs_runtime`` (torch + vllm_omni + AR-Diffusion engine):
 
@@ -32,7 +32,7 @@ try:
     from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import DreamZeroPipeline
     from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroStageCarrier
     from vllm_omni.diffusion.stage_roles import DECODE, DENOISE, ENCODE
-    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 except Exception as exc:  # pragma: no cover - import-environment dependent
     pytest.skip(f"vllm_omni runtime unavailable: {exc}", allow_module_level=True)
@@ -44,34 +44,34 @@ pytestmark = pytest.mark.needs_runtime
 
 
 def test_dreamzero_declares_disaggregated_capability():
-    """DreamZero must declare the collapsed SupportsDisaggregatedExecution disaggregation contract.
+    """DreamZero must declare the collapsed DiffusionV2Atoms disaggregation contract.
 
     ``supports_disaggregated_execution(pipeline)`` gates on the explicit
-    ``supports_disaggregated_execution`` flag AND the full ``SupportsDisaggregatedExecution``
+    ``supports_disaggregated_execution`` flag AND the full ``DiffusionV2Atoms``
     method surface (a @runtime_checkable Protocol). Missing either would make the
     runner reject DreamZero's encode/denoise/decode stages at startup. DreamZero
     stays OFF the single-process step runner (``supports_step_execution`` False).
     """
-    from vllm_omni.diffusion.models.interface import SupportsDisaggregatedExecution
+    from vllm_omni.diffusion.models.interface import DiffusionV2Atoms
 
     assert DreamZeroPipeline.supports_disaggregated_execution is True
     assert DreamZeroPipeline.supports_step_execution is False
-    # Protocol structural check. NOTE: SupportsDisaggregatedExecution is a @runtime_checkable
+    # Protocol structural check. NOTE: DiffusionV2Atoms is a @runtime_checkable
     # Protocol with a non-method member (the ``supports_step_execution`` ClassVar),
     # and CPython forbids ``issubclass()`` against such a Protocol
     # ("Protocols with non-method members don't support issubclass()"). The
-    # runtime uses ``isinstance(pipeline_instance, SupportsDisaggregatedExecution)`` on a built
+    # runtime uses ``isinstance(pipeline_instance, DiffusionV2Atoms)`` on a built
     # pipeline (see supports_disaggregated_execution), which IS allowed. Building a
     # full DreamZero pipeline needs a checkpoint, so assert the method surface
-    # directly here (every SupportsDisaggregatedExecution method is present on the class) — the
+    # directly here (every DiffusionV2Atoms method is present on the class) — the
     # same structural guarantee without triggering the issubclass restriction.
     required_methods = [
         name
-        for name in dir(SupportsDisaggregatedExecution)
-        if not name.startswith("_") and callable(getattr(SupportsDisaggregatedExecution, name, None))
+        for name in dir(DiffusionV2Atoms)
+        if not name.startswith("_") and callable(getattr(DiffusionV2Atoms, name, None))
     ]
     missing = [m for m in required_methods if not hasattr(DreamZeroPipeline, m)]
-    assert not missing, f"DreamZeroPipeline is missing SupportsDisaggregatedExecution methods: {missing}"
+    assert not missing, f"DreamZeroPipeline is missing DiffusionV2Atoms methods: {missing}"
 
 
 # --- component ownership (torch only, no checkpoint) -----------------------
@@ -121,7 +121,7 @@ def test_component_spec_monolithic_owns_everything():
 
 
 def _make_encode_state_with_carrier():
-    state = StepRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams(seed=0))
+    state = DiffusionRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams(seed=0))
     carrier = DreamZeroStageCarrier(
         session_id="sess-A",
         embodiment_name="roboarena",
@@ -185,7 +185,7 @@ def test_unpack_mutates_state_and_reconstructs_carrier():
     state, carrier = _make_encode_state_with_carrier()
     payload = DreamZeroPipeline.pack_stage_state(_StubPipeline(), state, StageBoundary.ENCODE_TO_DIT)
     # unpack MUTATES a runner-created target state (does not build a fresh one).
-    target = StepRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams(seed=1))
+    target = DiffusionRequestState(request_id="req-1", sampling=OmniDiffusionSamplingParams(seed=1))
     returned = DreamZeroPipeline.unpack_stage_state(_StubPipeline(), payload, target)
     assert returned is target  # mutate-in-place, not a fresh state
     restored = target.extra[DreamZeroPipeline._CARRIER_KEY]
@@ -414,7 +414,7 @@ def _run_disaggregated_atoms(runner, obs, *, session_id, request_id, reset):
     exactly as ARDiffusionModelRunner.execute_model does for the denoise role.
     """
     from vllm_omni.diffusion.models.interface import StageBoundary
-    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
     pipeline = runner.pipeline
     sp = OmniDiffusionSamplingParams(
@@ -424,7 +424,7 @@ def _run_disaggregated_atoms(runner, obs, *, session_id, request_id, reset):
 
     # --- encode stage (no KV attached) ---
     pipeline._ar_diffusion_kv_state = None
-    state = StepRequestState(request_id=request_id, sampling=sp, prompt="")
+    state = DiffusionRequestState(request_id=request_id, sampling=sp, prompt="")
     state = pipeline.init_state(state)
     state = pipeline.check_inputs(state)
     state = pipeline.encode(state)
@@ -434,7 +434,7 @@ def _run_disaggregated_atoms(runner, obs, *, session_id, request_id, reset):
     enc_payload = type(enc_payload).from_dict(enc_payload.to_dict())
 
     # --- denoise stage (KV session attached, reused across chunks) ---
-    den_state = StepRequestState(request_id=request_id, sampling=sp, prompt="")
+    den_state = DiffusionRequestState(request_id=request_id, sampling=sp, prompt="")
     den_state = pipeline.unpack_stage_state(enc_payload, den_state)
     pipeline._ar_diffusion_kv_state = _acquire_disagg_kv_state(runner, session_id)
     try:
@@ -445,7 +445,7 @@ def _run_disaggregated_atoms(runner, obs, *, session_id, request_id, reset):
     den_payload = type(den_payload).from_dict(den_payload.to_dict())
 
     # --- decode stage (no KV attached) ---
-    dec_state = StepRequestState(request_id=request_id, sampling=sp, prompt="")
+    dec_state = DiffusionRequestState(request_id=request_id, sampling=sp, prompt="")
     dec_state = pipeline.unpack_stage_state(den_payload, dec_state)
     dec_state = pipeline.decode(dec_state)
     return pipeline.postprocess(dec_state)

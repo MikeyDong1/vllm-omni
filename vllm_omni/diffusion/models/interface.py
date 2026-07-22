@@ -7,14 +7,17 @@ what a loaded pipeline can do, plus the ``supports_*`` helpers that isinstance-p
 them:
 
 * input/output modality markers (image/audio);
-* :class:`SupportsStepExecution` — the slim step-level execution contract
-  (``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` / ``post_decode``);
-* :class:`SupportsDisaggregatedExecution` — the RFC #4590 whole-request
-  disaggregation contract (encode/denoise/decode atoms plus the
-  ``pack_stage_state`` / ``unpack_stage_state`` payload hooks and
-  ``required_components_for_stage``), kept SEPARATE from the step protocol
-  because a whole-request pipeline (e.g. DreamZero's dual video+action DiT loop
-  with model-owned AR-Diffusion KV) does not fit the single-tensor step atoms;
+* :class:`DiffusionV2Atoms` — the PR #4948 state-based atom contract shared by
+  request mode, step mode, and RFC #4590 disaggregated stages (``init_state`` /
+  ``check_inputs`` / ``encode`` / ``prepare`` / ``diffuse`` / ``decode`` /
+  ``postprocess`` plus the per-step atoms ``build_step_batch`` /
+  ``denoise_step`` / ``step_scheduler`` and the ``pack_stage_state`` /
+  ``unpack_stage_state`` payload hooks). ``supports_step_execution`` gates the
+  step runner; the RFC #4590 ``required_components_for_stage`` extension and the
+  ``supports_disaggregated_execution`` flag gate disaggregated stage execution.
+  A whole-request pipeline (e.g. DreamZero's dual video+action DiT loop with
+  model-owned AR-Diffusion KV) opts out of step mode and overrides ``diffuse``
+  with its own loop while still satisfying the atom surface;
 * :class:`SupportsComponentDiscovery` (submodule locations for offload/HSDP).
 
 :class:`StagePayload` is the transport envelope handed from one diffusion stage
@@ -56,7 +59,7 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.stage_roles import StageComponentSpec
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 def _transport():
@@ -101,23 +104,25 @@ class SupportAudioOutput(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Step-level execution protocol (upstream)
+# Legacy step-level execution protocol (retained for pipelines not yet migrated
+# to the #4948 DiffusionV2Atoms surface: helios / hunyuan_image3 / qwen_image /
+# diffusers_adapter). New/migrated pipelines implement DiffusionV2Atoms below.
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class SupportsStepExecution(Protocol):
-    """State-driven step-level execution protocol for diffusion pipelines.
+    """State-driven step-level execution protocol for legacy diffusion pipelines.
 
-    Pipelines should split request-level ``forward()`` into:
-    ``prepare_encode()`` (one-time request setup), ``denoise_step()``
-    (one denoise forward), ``step_scheduler()`` (one scheduler update),
-    and ``post_decode()`` (final decode).
+    Pipelines that have not migrated to :class:`DiffusionV2Atoms` split
+    request-level ``forward()`` into: ``prepare_encode()`` (one-time request
+    setup), ``denoise_step()`` (one denoise forward), ``step_scheduler()`` (one
+    scheduler update), and ``post_decode()`` (final decode).
     """
 
     supports_step_execution: ClassVar[bool] = True
 
-    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+    def prepare_encode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionRequestState:
         """Prepare request-level inputs and return initialized state."""
         ...
 
@@ -125,17 +130,17 @@ class SupportsStepExecution(Protocol):
         """Run one denoise forward on the runner-assembled batch."""
         ...
 
-    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
+    def step_scheduler(self, state: DiffusionRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
         """Run one scheduler step."""
         ...
 
-    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+    def post_decode(self, state: DiffusionRequestState, **kwargs: Any) -> DiffusionOutput:
         """Decode output after denoise loop or at a partial chunk boundary."""
         ...
 
 
 # ---------------------------------------------------------------------------
-# Disaggregated-execution transport envelope + protocol (RFC #4590 / #4948)
+# State-based diffusion atoms + transport envelope (PR #4948 / RFC #4590)
 # ---------------------------------------------------------------------------
 
 
@@ -163,7 +168,7 @@ class StagePayload:
     """Transport envelope handed from one diffusion stage to the next.
 
     The #4948 four-dict envelope, carrying the *data* one stage produces for the
-    next while a mutable runner-local ``StepRequestState`` never crosses a
+    next while a mutable runner-local ``DiffusionRequestState`` never crosses a
     process boundary. Public ``*_fields`` are runner-visible; ``private_*_fields``
     are model-private and only the owning pipeline interprets them. Both tensor
     dicts are sanitized to host memory at export; both scalar dicts are validated
@@ -365,57 +370,65 @@ class StagePayload:
 
 
 @runtime_checkable
-class SupportsDisaggregatedExecution(Protocol):
-    """Whole-request disaggregation atoms (RFC #4590), separate from step mode.
+class DiffusionV2Atoms(Protocol):
+    """State-based diffusion atoms shared by request mode and step mode (PR #4948).
 
-    A disaggregated pipeline splits ``forward()`` into stage atoms that the runner
-    drives one per worker: encode (``init_state`` -> ``check_inputs`` -> ``encode``
-    -> ``prepare``), denoise (``unpack_stage_state`` -> ``diffuse``), decode
-    (``unpack_stage_state`` -> ``decode`` -> ``postprocess``). The typed
-    :class:`StagePayload` produced by ``pack_stage_state`` carries the data across
-    the process boundary; ``required_components_for_stage`` lets each stage build
-    only the components its role owns.
+    A pipeline splits request-level ``forward()`` into small state-in/state-out
+    atoms that the runner drives:
 
-    This is intentionally NOT part of :class:`SupportsStepExecution`: a
-    whole-request denoise (e.g. DreamZero's dual video+action DiT loop with
-    model-owned AR-Diffusion KV) cannot be expressed as the single-tensor
-    ``denoise_step`` / ``step_scheduler`` step contract. A pipeline may implement
-    either, both, or neither.
+    * whole-request / golden path: ``init_state`` -> ``check_inputs`` ->
+      ``encode`` -> ``prepare`` -> ``diffuse`` -> ``decode`` -> ``postprocess``;
+    * step / continuous-batching path: ``build_step_batch`` ->
+      ``build_step_attention_metadata`` -> ``denoise_step`` -> ``step_scheduler``
+      (the default ``diffuse`` in :class:`DiffusionV2AtomDefaultsMixin` composes
+      these into the whole-request loop);
+    * disaggregated stages (RFC #4590): the runner drives encode on one worker,
+      ``diffuse`` on another, and ``decode`` / ``postprocess`` on a third, moving
+      the typed :class:`StagePayload` produced by ``pack_stage_state`` across the
+      process boundary and re-hydrating it with ``unpack_stage_state``;
+      ``required_components_for_stage`` lets each stage build only the components
+      its role owns.
+
+    ``supports_step_execution`` gates whether the step runner may drive the model
+    through the per-step atoms. A whole-request pipeline (e.g. DreamZero's dual
+    video+action DiT loop with model-owned AR-Diffusion KV) sets it ``False`` and
+    overrides ``diffuse`` with its own loop while still satisfying the atom
+    surface for the disaggregated / golden path.
     """
 
-    supports_disaggregated_execution: ClassVar[bool] = True
+    supports_step_execution: ClassVar[bool] = True
 
-    def init_state(self, state: StepRequestState) -> StepRequestState:
+    def init_state(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Initialize pipeline-private fields on a newly created request state."""
         ...
 
-    def check_inputs(self, state: StepRequestState) -> StepRequestState:
+    def check_inputs(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Validate request inputs before model work begins."""
         ...
 
-    def encode(self, state: StepRequestState) -> StepRequestState:
+    def encode(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Run text/input encoders and populate encoded prompt fields."""
         ...
 
-    def prepare(self, state: StepRequestState) -> StepRequestState:
+    def prepare(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Prepare model-specific denoise state after encode."""
         ...
 
-    def diffuse(self, state: StepRequestState) -> StepRequestState:
-        """Run the full whole-request diffusion loop on the restored state."""
+    def diffuse(self, state: DiffusionRequestState) -> DiffusionRequestState:
+        """Run the full diffusion loop for request-mode/golden-path execution."""
         ...
 
-    def decode(self, state: StepRequestState) -> StepRequestState:
+    def decode(self, state: DiffusionRequestState) -> DiffusionRequestState:
         """Decode raw latent state into the model output representation."""
         ...
 
-    def postprocess(self, state: StepRequestState) -> DiffusionOutput:
+    def postprocess(self, state: DiffusionRequestState) -> DiffusionOutput:
         """Apply model-specific output post-processing and return final output."""
         ...
 
     def pack_stage_state(
         self,
-        state: StepRequestState,
+        state: DiffusionRequestState,
         boundary: StageBoundary,
     ) -> StagePayload:
         """Pack state for a stage boundary without exposing model-private schema to the runner."""
@@ -424,19 +437,50 @@ class SupportsDisaggregatedExecution(Protocol):
     def unpack_stage_state(
         self,
         payload: StagePayload,
-        state: StepRequestState,
-    ) -> StepRequestState:
+        state: DiffusionRequestState,
+    ) -> DiffusionRequestState:
         """Apply a received stage payload to an existing request state."""
+        ...
+
+    def build_step_batch(
+        self,
+        states: list[DiffusionRequestState],
+        *,
+        cached_batch: InputBatch | None = None,
+    ) -> InputBatch:
+        """Build the runner-visible step batch for one scheduler tick."""
+        ...
+
+    def build_step_attention_metadata(
+        self,
+        input_batch: InputBatch,
+    ) -> object | None:
+        """Build optional forward-context attention metadata for the step batch."""
+        ...
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+    ) -> torch.Tensor | None:
+        """Run one DiT denoise step on the runner-assembled batch."""
+        ...
+
+    def step_scheduler(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+    ) -> DiffusionRequestState:
+        """Apply one scheduler step to a request-local state."""
         ...
 
     @classmethod
     def required_components_for_stage(cls, model_stage: str) -> StageComponentSpec:
         """Declare which components a given disaggregated stage role must build.
 
-        Queried before module construction so a stage process loads only the
-        components its role owns (see
-        :class:`~vllm_omni.diffusion.stage_roles.StageComponentSpec`). Monolithic
-        pipelines return the all-components spec.
+        RFC #4590 extension to the #4948 atom surface. Queried before module
+        construction so a stage process loads only the components its role owns
+        (see :class:`~vllm_omni.diffusion.stage_roles.StageComponentSpec`).
+        Monolithic pipelines return the all-components spec.
         """
         ...
 
@@ -467,23 +511,32 @@ class SupportsComponentDiscovery(Protocol):
 
 
 def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+    """Return whether `pipeline` can be driven by the step runner.
 
-    return isinstance(pipeline, SupportsStepExecution)
+    Requires the explicit ``supports_step_execution`` flag (so a whole-request
+    pipeline like DreamZero can opt out even though it satisfies the atom
+    surface) plus EITHER the #4948 :class:`DiffusionV2Atoms` contract (migrated
+    pipelines) OR the legacy :class:`SupportsStepExecution` contract (pipelines
+    not yet migrated: helios / hunyuan_image3 / qwen_image / diffusers_adapter).
+    """
+
+    if getattr(pipeline, "supports_step_execution", False) is not True:
+        return False
+    return isinstance(pipeline, DiffusionV2Atoms) or isinstance(pipeline, SupportsStepExecution)
 
 
 def supports_disaggregated_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` can be driven as a disaggregated stage.
+    """Return whether `pipeline` can be driven as a disaggregated stage (RFC #4590).
 
     Uses an explicit ``supports_disaggregated_execution`` flag plus the full
-    :class:`SupportsDisaggregatedExecution` contract (the RFC #4590 + #4948
-    surface — the encode/denoise/decode atoms, ``pack_stage_state`` /
-    ``unpack_stage_state`` payload hooks, and ``required_components_for_stage``).
-    ``isinstance`` against the runtime-checkable Protocol validates the hooks are
-    present; the flag lets a step-only pipeline opt out even though it satisfies
-    the same atom surface.
+    :class:`DiffusionV2Atoms` contract (the #4948 atom surface — the
+    encode/diffuse/decode atoms, ``pack_stage_state`` / ``unpack_stage_state``
+    payload hooks, plus the RFC #4590 ``required_components_for_stage``
+    extension). ``isinstance`` against the runtime-checkable Protocol validates
+    the hooks are present; the flag lets a step-only pipeline opt out even though
+    it satisfies the same atom surface.
     """
 
     if not bool(getattr(pipeline, "supports_disaggregated_execution", False)):
         return False
-    return isinstance(pipeline, SupportsDisaggregatedExecution)
+    return isinstance(pipeline, DiffusionV2Atoms)

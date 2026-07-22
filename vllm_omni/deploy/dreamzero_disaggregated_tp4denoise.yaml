@@ -8,13 +8,13 @@
 # Topology is declared in vllm_omni/model_executor/models/dreamzero/pipeline.py
 # (DREAMZERO_DISAGGREGATED_PIPELINE). Each stage runs as a native diffusion stage
 # distinguished by model_stage; the generic diffusion transition processor moves
-# the typed DiffusionStagePayload between them.
+# the typed StagePayload between them.
 #
 # Stage ownership (see StageComponentSpec in
 # DreamZeroPipeline.required_components_for_stage):
 #   stage 0 (encode):  tokenizer + text/image encoders + VAE encoder   (1 device)
 #   stage 1 (denoise): CausalWan DiT + schedulers + action head + AR-Diffusion KV (TP=4, 4 devices)
-#   stage 2 (decode):  VAE decoder + video/action postprocess          (1 device)
+#   stage 2 (decode):  decode/postprocess stage, no heavy component   (1 device)
 #
 # Engine backends:
 #   - The denoise stage REQUIRES the AR-Diffusion engine (session-scoped paged KV).
@@ -67,6 +67,9 @@ stages:
         action_space: joint_position
 
   # ---- Stage 2: DECODE (standard diffusion engine, one device) ----
+  # Decode/postprocess stage.
+  # This stage does not load DreamZero's heavy encode or denoise components.
+  # It converts the final request state into actions and normalized latent output.
   - stage_id: 2
     devices: "5"
     max_num_seqs: 1

@@ -4,7 +4,7 @@
 
 RFC #4590 §2.3 requires a small typed envelope that carries the *data* one
 diffusion stage produces for the next, kept strictly separate from the mutable
-runner-local ``StepRequestState``. A ``StepRequestState`` must never
+runner-local ``DiffusionRequestState``. A ``DiffusionRequestState`` must never
 cross a process boundary; a stage payload may.
 
 The envelope type itself is now
@@ -113,7 +113,7 @@ def _looks_non_transportable(value: Any) -> str | None:
     lowered = name.lower()
     if "scheduler" in lowered:
         return f"scheduler object ({name})"
-    if name in ("StepRequestState", "DreamZeroState", "ARDiffusionKVState", "ARDiffusionKVCache"):
+    if name in ("DiffusionRequestState", "DreamZeroState", "ARDiffusionKVState", "ARDiffusionKVCache"):
         return f"process-local state object ({name})"
     if hasattr(value, "__next__") and hasattr(value, "__iter__") and name == "generator":
         return "generator"

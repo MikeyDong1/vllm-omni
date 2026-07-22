@@ -31,8 +31,8 @@ class DreamZeroStageCarrier:
     carrier's stable fields are marshalled through a ``StagePayload`` by the
     pipeline's ``pack_stage_state`` / ``unpack_stage_state`` hooks.
 
-    This is model-private state (kept out of the generic ``StepRequestState``
-    per RFC §2.3): it is stored on ``StepRequestState.extra`` and interpreted
+    This is model-private state (kept out of the generic ``DiffusionRequestState``
+    per RFC §2.3): it is stored on ``DiffusionRequestState.extra`` and interpreted
     only by DreamZero. The AR-Diffusion KV / live session objects are NEVER placed
     here — they stay on the denoise worker.
     """

@@ -41,7 +41,7 @@ Raw Request
 | latent preparation    |
 +-----------+-----------+
             |
-            | DiffusionStagePayload  (encode -> denoise)
+            | StagePayload  (encode -> denoise)
             v
 +-----------------------+
 | Denoise DiffusionStage|
@@ -50,13 +50,12 @@ Raw Request
 | AR-Diffusion KV       |
 +-----------+-----------+
             |
-            | DiffusionStagePayload  (denoise -> decode)
+            | StagePayload  (denoise -> decode)
             v
 +-----------------------+
 | Decode DiffusionStage |
-| VAE decode            |
-| action/video output   |
-| postprocess           |
+| decode/postprocess    |
+| action/latent output  |
 +-----------+-----------+
             |
             v
@@ -86,30 +85,33 @@ a pure table (`stage_roles.resolve_execution_path`), mirrored in
 
 ### State vs payload
 
-`DiffusionRequestState` is **mutable runner-local state** and never crosses a
-process boundary. Inter-stage data travels as a typed, versioned
-`DiffusionStagePayload` (`vllm_omni/diffusion/stage_payload.py`):
+`StepRequestState` (`vllm_omni/diffusion/worker/utils.py`) is **mutable
+runner-local state** and never crosses a process boundary. Inter-stage data
+travels as a typed, versioned `StagePayload`
+(`vllm_omni/diffusion/models/interface.py`, transport helpers in
+`vllm_omni/diffusion/stage_payload.py`):
 
 ```python
-@dataclass(frozen=True)
-class DiffusionStagePayload:
-    schema_version: int
+@dataclass
+class StagePayload:
     request_id: str
-    source_stage: str
-    target_stage: str
-    payload_type: str
-    tensors: dict[str, torch.Tensor]   # the only place tensors live
-    metadata: dict[str, Any]           # small, transportable, model-private
+    boundary: StageBoundary                          # ENCODE_TO_DIT | DIT_TO_DECODE
+    scalar_fields: dict[str, object]                  # runner-visible, transportable
+    tensor_fields: dict[str, torch.Tensor]             # runner-visible tensors
+    private_scalar_fields: dict[str, object]           # model-private, transportable
+    private_tensor_fields: dict[str, torch.Tensor]     # model-private tensors
+    payload_version: int = STAGE_PAYLOAD_SCHEMA_VERSION
 ```
 
 Invariants (enforced by `validate()`):
 
-* request identity, source/target stages, and `payload_type` are explicit;
-* the schema is versioned; consumers reject unknown versions;
-* tensors are separate from metadata; the envelope never grows a per-model field;
+* request identity and `boundary` are explicit;
+* the schema is versioned (`payload_version`); consumers reject unknown versions;
+* tensors are separate from scalar metadata in both the public and private
+  dicts; the envelope never grows a per-model field;
 * modules, generators, CUDA streams, schedulers, and process-local state objects
   are rejected early (`NonTransportableValueError`);
-* model-specific keys are interpreted only by the owning pipeline;
+* private fields are interpreted only by the owning pipeline;
 * tensors can later be backed by connector handles without changing the envelope.
 
 Tensors are moved to host memory, detached, made contiguous, and cloned at the
@@ -119,19 +121,22 @@ scattered through model code.
 
 ### Pipeline capability protocol
 
-`vllm_omni/diffusion/models/interface.py` adds:
+`vllm_omni/diffusion/models/interface.py` adds `SupportsDisaggregatedExecution`
+(runtime-checkable), separate from `SupportsStepExecution` — a whole-request
+denoise loop with model-owned session/KV (e.g. DreamZero's dual video+action
+DiT loop) cannot be expressed as the single-tensor `denoise_step` /
+`step_scheduler` step contract. A pipeline may implement either, both, or
+neither. The protocol declares:
 
-* `SupportsDisaggregatedDiffusionExecution` (runtime-checkable) —
-  `export_stage_payload`, `import_stage_payload`,
-  `required_components_for_stage`, plus the `supports_disaggregated_execution`
-  flag. `supports_disaggregated_execution(pipeline)` is the capability helper,
-  paralleling the existing `supports_step_execution`.
-* `SupportsDiffusionAtoms` (additive) — finer atoms `check_inputs`,
-  `encode_conditions`, `prepare_latents_and_timesteps`, `decode_latents`,
-  `postprocess_outputs`. The runner prefers these via `run_encode_atoms` /
-  `run_decode_atoms` and falls back to the four-method step contract
-  (`prepare_encode` / `post_decode`) when absent — so existing step pipelines are
-  untouched.
+* the whole-request atoms `init_state`, `check_inputs`, `encode`, `prepare`,
+  `diffuse`, `decode`, `postprocess`;
+* `pack_stage_state` / `unpack_stage_state` — pack/apply a `StagePayload` at a
+  stage boundary without exposing model-private schema to the runner;
+* `required_components_for_stage(model_stage)` — declares which components a
+  given stage role must build;
+* the `supports_disaggregated_execution` `ClassVar[bool]` flag.
+  `supports_disaggregated_execution(pipeline)` is the capability helper,
+  paralleling the existing `supports_step_execution(pipeline)`.
 
 A stage that requests `encode`/`denoise`/`decode` on a pipeline lacking the
 disaggregated capability fails at **startup** (`load_model`), not mid-forward.
@@ -151,21 +156,26 @@ return self._execute_monolithic(req, kv_prefetch_jobs=kv_prefetch_jobs)   # unch
 ```
 
 * **Encode stage** — creates runner-local state from the raw request, initializes
-  the generator, runs the encode atoms, exports an `encode → denoise` payload,
-  returns an *intermediate* output (payload in `custom_output`), and releases the
+  the generator, runs `init_state → check_inputs → encode → prepare`, packs an
+  `encode → denoise` (`ENCODE_TO_DIT`) payload via `pack_stage_state`, returns
+  an *intermediate* output (payload in `custom_output`), and releases the
   state. It never runs the DiT, advances the scheduler, or decodes.
-* **Denoise stage** — restores state from the payload via `import_stage_payload`
-  (which attaches live session/KV through the normal engine mechanism, *never*
-  from the payload), caches it, runs the model's `run_denoise`, exports a
-  `denoise → decode` payload. It never re-runs encode for a payload-origin
+* **Denoise stage** — creates a fresh runner-local state from the request (so
+  request-level sampling/generator/session plumbing is preserved), applies the
+  incoming payload onto it via `unpack_stage_state` (live session/KV state, for
+  DreamZero the AR-Diffusion KV, is attached through the normal engine
+  mechanism by the runner subclass, *never* from the payload), runs the
+  pipeline's whole-request `diffuse` atom, and packs a `denoise → decode`
+  (`DIT_TO_DECODE`) payload. It never re-runs encode for a payload-origin
   request — the origin is explicit (payload vs raw), not inferred from a
   new-request id set.
-* **Decode stage** — restores decode state, runs the `decode` (no-op for
-  DreamZero) + `postprocess` atoms, and returns the user-visible
-  `DiffusionOutput` (denormalized actions + latent video). It never instantiates
-  or runs the DiT or a scheduler, and — for DreamZero — never invokes the VAE
-  decoder (see *Decode ownership matches decode behavior* below). It also
-  cross-checks the incoming payload's `request_id` against the request (RFC §B.1).
+* **Decode stage** — restores decode state via `unpack_stage_state`, runs the
+  `decode` (no-op for DreamZero) + `postprocess` atoms, and returns the
+  user-visible `DiffusionOutput` (denormalized actions + latent video). It
+  never instantiates or runs the DiT or a scheduler, and — for DreamZero —
+  never invokes the VAE decoder (see *Decode ownership matches decode
+  behavior* below). It also cross-checks the incoming payload's `request_id`
+  against the request (RFC §B.1).
 
 The historical "new request ⇒ run `prepare_encode`" coupling (`state.request_id in
 new_request_ids` in the stepwise path) is *not* used by the disaggregated denoise
@@ -227,7 +237,7 @@ phase — declaration, construction, and use must agree.)
 ## DreamZero stage ownership & session/KV
 
 **Critical invariant:** AR-Diffusion session/KV state lives **only** on the
-denoise stage. The encode `DiffusionStagePayload` carries stable data
+denoise stage. The encode `StagePayload` carries stable data
 (encoded text/image conditions, `ys`/`clip_feas`, initial latents+noise, timestep
 schedule params, embodiment/state metadata, session id, CFG metadata, shape
 metadata). The live paged KV, the `FlowUniPCMultistepScheduler`, and the
@@ -242,7 +252,7 @@ existing math helpers. `forward()` now composes all three on one carrier and one
 session state — so the monolithic golden path and the disaggregated path run the
 **same** code, making numerical equivalence structural rather than coincidental.
 The DreamZero-private inter-phase carrier (`DreamZeroStageCarrier`) lives on
-`DiffusionRequestState.extra` (model-private), never on the generic state fields.
+`StepRequestState.extra` (model-private), never on the generic state fields.
 
 ## Multi-chunk session progress (RFC §A)
 

@@ -164,6 +164,12 @@ class DiffusionRequestState:
         return self.chunk_index >= self.total_chunks
 
 
+# Compatibility alias for pipelines that still use the pre-#4948 state name.
+# DreamZero uses DiffusionRequestState directly; keeping this alias avoids
+# touching unrelated model implementations in this PR.
+StepRequestState = DiffusionRequestState
+
+
 class BaseRunnerOutput(ABC):
     @abstractmethod
     def get_request_output(self, request_id: str) -> RunnerOutput | None:

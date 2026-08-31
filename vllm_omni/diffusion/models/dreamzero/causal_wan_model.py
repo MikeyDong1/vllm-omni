@@ -149,6 +149,39 @@ def rope_action_apply(
     return x
 
 
+def _materialize_block_freqs(freqs: torch.Tensor) -> torch.Tensor:
+    """Real ``(..., 2)`` cos/sin table as a freshly allocated tensor, not a view.
+
+    ``view_as_real`` on its own returns a *view*, and both of the reasons this matters
+    are about what the compiled block sees, not about the values:
+
+    1. ``torch._dynamo.mark_dynamic`` cannot always place a hint on a view -- it raises
+       when the base cannot carry it. The next commit marks this table's sequence dim,
+       and on a view that marking silently does nothing, which quietly costs one graph
+       per query length. A real allocation always carries the hint.
+    2. Dynamo guards on the tensor's dispatch key set, and the two branches of
+       :func:`causal_rope_action_freqs` reach ``view_as_real`` with different bases: the
+       no-action branch views the table handed down from ``_create_freqs``, while the
+       action branch views a ``torch.cat`` performed here. Under ``inference_mode`` those
+       do not reliably agree -- a tensor viewed out of a longer-lived buffer keeps
+       ``(XPU, ADInplaceOrView, AutogradXPU, AutocastXPU)`` where a freshly allocated one
+       carries ``(XPU, AutocastXPU)`` -- and a mismatch makes prefill and diffuse
+       guard-incompatible, costing a second graph:
+
+           tensor 'freqs' dispatch key set mismatch. expected
+           DispatchKeySet(XPU, BackendSelect, ADInplaceOrView), actual
+           DispatchKeySet(XPU, BackendSelect)
+
+       Allocating on both paths makes the branches hand the block the same flavour of
+       tensor by construction.
+
+    ``.contiguous()`` is not a substitute: on an already-contiguous view it returns the
+    same view and drops nothing. The copy is of a table four orders of magnitude smaller
+    than the activations it rotates, once per forward against the 80 rotations it feeds.
+    """
+    return torch.view_as_real(freqs).clone()
+
+
 def causal_rope_action_freqs(
     freqs: torch.Tensor,
     freqs_action: torch.Tensor,
@@ -168,9 +201,12 @@ def causal_rope_action_freqs(
     to build it, so no complex tensor reaches the compiled blocks, where inductor
     would fall back to eager. Converting here costs one view of a table that is
     four orders of magnitude smaller than the tensors it rotates.
+
+    Both exits route through :func:`_materialize_block_freqs`, which is what makes the
+    table markable and its dispatch key set branch-independent.
     """
     if action_register_length is None:
-        return torch.view_as_real(freqs)
+        return _materialize_block_freqs(freqs)
     expected_length = num_action_per_block + num_state_per_block
     if action_register_length != expected_length:
         raise ValueError(
@@ -182,7 +218,7 @@ def causal_rope_action_freqs(
     ]
     freqs_state = freqs_state[action_state_index * num_state_per_block : (action_state_index + 1) * num_state_per_block]
     freqs_1d = torch.cat([freqs_action, freqs_state], dim=0).view(action_register_length, 1, -1)
-    return torch.view_as_real(torch.cat([freqs, freqs_1d], dim=0))
+    return _materialize_block_freqs(torch.cat([freqs, freqs_1d], dim=0))
 
 
 # ── Normalization ───────────────────────────────────────────────────

@@ -1,14 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+
+_log = init_logger(__name__)
+
+# Diagnostic-only escape hatch. On an accelerator that has a paged
+# FlashAttention kernel, dropping to the dense Python reference still produces
+# correct output, so the resulting slowdown hides behind "it works" instead of
+# failing. The default is therefore to raise; set this to 1/true/yes/on to
+# reproduce the reference path deliberately (it warns once and records
+# ``ar_diffusion_paged_attention_backend == "reference"``).
+_ALLOW_REFERENCE_ATTN_ENV = "VLLM_OMNI_AR_DIFFUSION_ALLOW_REFERENCE_ATTN"
+
+# Backend used by the most recent ar_diffusion_paged_attention call:
+# "cuda" | "xpu" | "rocm" | "reference". Exposed so a silent regression back to
+# the dense reference is observable rather than invisible.
+ar_diffusion_paged_attention_backend: str | None = None
+
+
+def _reference_attn_allowed() -> bool:
+    return os.environ.get(_ALLOW_REFERENCE_ATTN_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
@@ -391,6 +414,8 @@ def ar_diffusion_paged_attention(
     ``query`` may be ``(B, L, H, D)`` or already flattened as ``(T, H, D)``.
     ``key_cache`` / ``value_cache`` are ``(num_blocks, block_size, H, D)``.
     """
+    global ar_diffusion_paged_attention_backend
+
     batched = query.dim() == 4
     if batched:
         batch, q_len = query.shape[:2]
@@ -398,7 +423,15 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
-    if not query_flat.is_cuda:
+    # Dispatch on device *type* rather than Tensor.is_cuda: an XPU tensor
+    # reports is_cuda == False, so every call landed in the dense Python
+    # reference below even though XPU has a paged FlashAttention kernel.
+    device_type = query_flat.device.type
+
+    if device_type not in ("cuda", "xpu"):
+        # CPU and any other device type: dense reference. Intended for unit
+        # tests and debugging, not for serving.
+        ar_diffusion_paged_attention_backend = "reference"
         out = _reference_paged_attention(
             query_flat,
             key_cache,
@@ -409,7 +442,7 @@ def ar_diffusion_paged_attention(
             softmax_scale,
             causal=causal,
         )
-    elif torch.version.hip is not None:
+    elif device_type == "cuda" and torch.version.hip is not None:
         # vllm.vllm_flash_attn contains CUDA-only extensions. ROCm's AITER and
         # upstream flash-attn expose the standard cu_seqlens_k API instead of
         # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
@@ -437,26 +470,67 @@ def ar_diffusion_paged_attention(
             softmax_scale=float(softmax_scale),
             causal=causal,
         )
+        ar_diffusion_paged_attention_backend = "rocm"
     else:
-        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        # CUDA and XPU both go through vLLM's platform-dispatched entry point,
+        # which binds flash_attn_varlen_func per platform (CUDA ->
+        # vllm.vllm_flash_attn, XPU -> vllm-xpu-kernels paged chunk-prefill).
+        # The paged pools and block_table are handed over as-is, so neither
+        # platform gathers a dense K/V copy.
+        from vllm.v1.attention.backends import fa_utils
 
-        fa_version = _resolve_fa_version(query_flat.shape[-1])
+        if not fa_utils.is_flash_attn_varlen_func_available():
+            if not _reference_attn_allowed():
+                raise RuntimeError(
+                    f"Paged FlashAttention is unavailable on device '{device_type}'; refusing to fall back "
+                    "to the dense Python reference, which is correct but far slower. Set "
+                    f"{_ALLOW_REFERENCE_ATTN_ENV}=1 to allow it for debugging."
+                )
+            _log.warning_once(
+                "%s is set: paged FlashAttention is unavailable on '%s', using the dense Python "
+                "reference. DEBUG ONLY -- expect a large slowdown.",
+                _ALLOW_REFERENCE_ATTN_ENV,
+                device_type,
+            )
+            ar_diffusion_paged_attention_backend = "reference"
+            out = _reference_paged_attention(
+                query_flat,
+                key_cache,
+                value_cache,
+                block_table,
+                query_start_loc,
+                seq_lens,
+                softmax_scale,
+                causal=causal,
+            )
+        else:
+            # CUDA picks a kernel version per head size; the XPU kernel is FA2
+            # and ignores the argument.
+            fa_version = _resolve_fa_version(query_flat.shape[-1]) if device_type == "cuda" else 2
 
-        out = torch.empty_like(query_flat)
-        flash_attn_varlen_func(
-            q=query_flat,
-            k=key_cache,
-            v=value_cache,
-            out=out,
-            cu_seqlens_q=query_start_loc,
-            max_seqlen_q=int(max_query_len),
-            seqused_k=seq_lens,
-            max_seqlen_k=int(max_seq_len),
-            softmax_scale=float(softmax_scale),
-            causal=causal,
-            block_table=block_table,
-            fa_version=fa_version,
-        )
+            out = torch.empty_like(query_flat)
+            result = fa_utils.flash_attn_varlen_func(
+                q=query_flat,
+                k=key_cache,
+                v=value_cache,
+                out=out,
+                cu_seqlens_q=query_start_loc,
+                max_seqlen_q=int(max_query_len),
+                seqused_k=seq_lens,
+                max_seqlen_k=int(max_seq_len),
+                softmax_scale=float(softmax_scale),
+                causal=causal,
+                block_table=block_table,
+                fa_version=fa_version,
+            )
+            # The two kernels differ on the output contract: CUDA writes into
+            # `out` and returns it (or a tuple), XPU returns its own tensor.
+            # Prefer whatever was returned and keep `out` as the fallback.
+            if isinstance(result, (tuple, list)):
+                result = result[0] if result else None
+            if result is not None:
+                out = result
+            ar_diffusion_paged_attention_backend = device_type
 
     if batched:
         return out.reshape(query.shape)

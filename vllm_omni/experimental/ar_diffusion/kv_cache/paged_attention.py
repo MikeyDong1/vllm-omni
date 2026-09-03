@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations

@@ -33,6 +33,7 @@ import os
 
 import pytest
 import torch
+import torch._dynamo
 
 from vllm_omni.diffusion.models.dreamzero.causal_wan_model import (
     _mark_seq_dynamic,
@@ -158,13 +159,17 @@ def test_paged_write_attn_derives_max_query_len_from_query(monkeypatch) -> None:
 
     sentinel = -12345
     query_len, heads, head_dim = 1785, 4, 8
+    block_size = 16
     captured: dict[str, object] = {}
 
+    # Positional layout of vllm_omni::ar_diffusion_paged_write_attn: query, k_curr,
+    # v_curr, k_act, v_act, key_pool, value_pool, block_size, video_slots,
+    # action_slots, block_table, query_start_loc, seq_lens, max_query_len, max_seq_len,
+    # softmax_scale.
+    _MAX_QUERY_LEN_ARG = 13
+
     def spy(*args):
-        # Positional layout of vllm_omni::ar_diffusion_paged_write_attn; index 11 is
-        # max_query_len (query, k_curr, v_curr, k_act, v_act, layer_idx, video_slots,
-        # action_slots, block_table, query_start_loc, seq_lens, max_query_len, ...).
-        captured["max_query_len"] = args[11]
+        captured["max_query_len"] = args[_MAX_QUERY_LEN_ARG]
         captured["all_args"] = args
         return torch.empty_like(args[0])
 
@@ -175,6 +180,9 @@ def test_paged_write_attn_derives_max_query_len_from_query(monkeypatch) -> None:
     value = torch.zeros(query_len, heads, head_dim)
     inputs = pa.ARDiffusionPagedLayerInputs(
         layer_idx=torch.tensor(0),
+        key_pool=torch.zeros(block_size, heads, head_dim),
+        value_pool=torch.zeros(block_size, heads, head_dim),
+        block_size=block_size,
         seq_len=1760,
         video_slots=torch.zeros(1, dtype=torch.int64),
         action_slots=torch.zeros(1, dtype=torch.int64),
@@ -188,7 +196,10 @@ def test_paged_write_attn_derives_max_query_len_from_query(monkeypatch) -> None:
     pa.paged_write_attn(inputs, query, key, value, None, None, 1.0)
 
     assert captured["max_query_len"] == query_len
-    assert sentinel not in captured["all_args"], "inputs.max_query_len still reaches the op"
+    # Compare only the int arguments: `sentinel in args` would run == against the
+    # tensor arguments and raise on the multi-element result.
+    int_args = [a for a in captured["all_args"] if isinstance(a, int)]
+    assert sentinel not in int_args, "inputs.max_query_len still reaches the op"
 
 
 # ── The acceptance test: compilation count must not grow with AR geometry ────────

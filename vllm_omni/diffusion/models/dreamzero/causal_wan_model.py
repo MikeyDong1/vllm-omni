@@ -17,6 +17,7 @@ import math
 from typing import Any
 
 import torch
+import torch._dynamo  # noqa: F401  -- _mark_seq_dynamic needs the submodule bound
 import torch.nn as nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,

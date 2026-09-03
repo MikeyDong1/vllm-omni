@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations
@@ -207,6 +208,20 @@ class ARDiffusionPagedForwardContext:
         only consumes prebuilt tensors via ``ARDiffusionPagedLayerInputs``.
         """
         if getattr(self, "_prepared", False):
+            # Reused for a later denoise step: the session cache handed this same
+            # object back, so the block table, slot mappings and metadata tensors
+            # are already built and still valid. But the cache key covers seq_len
+            # and the commit epoch, while action_len/query_len arrive here as
+            # separate arguments -- if either moved, the cached block table is
+            # wrong for this call and silently reusing it would corrupt attention
+            # addressing. Fail loud rather than compute a wrong answer.
+            if int(query_len) != int(self.query_len) or int(action_len) != int(self._action_len):
+                raise RuntimeError(
+                    "AR-Diffusion paged context reused with different geometry: "
+                    f"cached query_len={self.query_len} action_len={self._action_len}, "
+                    f"requested query_len={int(query_len)} action_len={int(action_len)}. "
+                    "The forward-context cache key is missing a term."
+                )
             return
         self.ensure_video_slots(device)
         (

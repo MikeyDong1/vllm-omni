@@ -504,11 +504,18 @@ def _paged_write_attn_impl(
     max_seq_len: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    key_pool[video_slots] = k_curr.to(key_pool.dtype)
-    value_pool[video_slots] = v_curr.to(value_pool.dtype)
+    # index_copy_ rather than ``pool[slots] = value``: the slot ids are unique by
+    # construction (one KV slot per distinct token -- a duplicate would already be
+    # cache corruption), so the duplicate-index and accumulate semantics that
+    # advanced indexing has to support are dead weight here. index_copy_ states
+    # that precondition in the API and takes the plain scatter path. Semantics are
+    # otherwise identical: for a 1-D integer index along dim 0 with unique
+    # entries, ``pool[slots] = v`` IS ``pool.index_copy_(0, slots, v)``.
+    key_pool.index_copy_(0, video_slots, k_curr.to(key_pool.dtype))
+    value_pool.index_copy_(0, video_slots, v_curr.to(value_pool.dtype))
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        key_pool[action_slots] = k_act.to(key_pool.dtype)
-        value_pool[action_slots] = v_act.to(value_pool.dtype)
+        key_pool.index_copy_(0, action_slots, k_act.to(key_pool.dtype))
+        value_pool.index_copy_(0, action_slots, v_act.to(value_pool.dtype))
     key_cache = key_pool.unflatten(0, (-1, block_size))
     value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(

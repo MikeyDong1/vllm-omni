@@ -33,6 +33,47 @@ def _reference_attn_allowed() -> bool:
     return os.environ.get(_ALLOW_REFERENCE_ATTN_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+# KV page sizes the installed XPU kernel has refused at runtime.
+#
+# ``is_flash_attn_varlen_func_available()`` answers "is a varlen entry point
+# bound", not "can it service this geometry" -- on XPU it returns True
+# unconditionally. vllm-xpu-kernels' chunk_prefill separately validates the page
+# size against an enumerated set (16, 32, or a positive multiple of 64) and raises
+# from C++ when it does not match. DreamZero's page size is its frame length
+# (e.g. 880 = 16 x 55), which is a multiple of 16 but not of 32, so it is refused
+# by kernel builds predating that validation being relaxed to the real constraint.
+#
+# Discovering it by attempt rather than by re-encoding the kernel's rule here is
+# deliberate: the rule is a property of the installed kernel, not of this file, so
+# a hard-coded copy would go stale the moment the kernel accepts more shapes.
+_XPU_REJECTED_PAGE_SIZES: set[int] = set()
+_KERNEL_PAGE_SIZE_REJECTION = "unsupported block_size"
+
+
+def _record_rejected_page_size(device_type: str, page_size: int, exc: RuntimeError) -> None:
+    """Remember an XPU page-size refusal, or re-raise ``exc`` untouched.
+
+    Only the XPU kernel's own page-size complaint is absorbed. Anything else --
+    OOM, a bad block table, a dtype mismatch -- propagates, because swallowing it
+    would turn a real bug into a silent slowdown, which is the failure mode this
+    dispatch exists to remove.
+    """
+    if device_type != "xpu" or _KERNEL_PAGE_SIZE_REJECTION not in str(exc):
+        raise exc
+    _XPU_REJECTED_PAGE_SIZES.add(page_size)
+    _log.warning_once(
+        "The installed vllm-xpu-kernels build refuses a %d-token KV page for paged "
+        "attention, so AR-Diffusion is falling back to the dense Python reference "
+        "(expect a large slowdown; ar_diffusion_paged_attention_backend reports "
+        "'reference'). Its chunk_prefill accepts 16, 32, or a positive multiple of "
+        "64; the real kernel constraint is any positive multiple of 16. Upgrade to a "
+        "build whose validation reflects that, or configure a page size it accepts. "
+        "Kernel error: %s",
+        page_size,
+        exc,
+    )
+
+
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
 
@@ -427,12 +468,10 @@ def ar_diffusion_paged_attention(
     # reports is_cuda == False, so every call landed in the dense Python
     # reference below even though XPU has a paged FlashAttention kernel.
     device_type = query_flat.device.type
+    page_size = int(key_cache.shape[1])
 
-    if device_type not in ("cuda", "xpu"):
-        # CPU and any other device type: dense reference. Intended for unit
-        # tests and debugging, not for serving.
-        ar_diffusion_paged_attention_backend = "reference"
-        out = _reference_paged_attention(
+    def reference() -> torch.Tensor:
+        return _reference_paged_attention(
             query_flat,
             key_cache,
             value_cache,
@@ -442,6 +481,18 @@ def ar_diffusion_paged_attention(
             softmax_scale,
             causal=causal,
         )
+
+    if device_type not in ("cuda", "xpu"):
+        # CPU and any other device type: dense reference. Intended for unit
+        # tests and debugging, not for serving.
+        ar_diffusion_paged_attention_backend = "reference"
+        out = reference()
+    elif device_type == "xpu" and page_size in _XPU_REJECTED_PAGE_SIZES:
+        # Already learned that this kernel build cannot service this page size
+        # (see _record_rejected_page_size). Skip the kernel instead of paying a
+        # failed dispatch per layer per step.
+        ar_diffusion_paged_attention_backend = "reference"
+        out = reference()
     elif device_type == "cuda" and torch.version.hip is not None:
         # vllm.vllm_flash_attn contains CUDA-only extensions. ROCm's AITER and
         # upstream flash-attn expose the standard cu_seqlens_k API instead of
@@ -493,44 +544,42 @@ def ar_diffusion_paged_attention(
                 device_type,
             )
             ar_diffusion_paged_attention_backend = "reference"
-            out = _reference_paged_attention(
-                query_flat,
-                key_cache,
-                value_cache,
-                block_table,
-                query_start_loc,
-                seq_lens,
-                softmax_scale,
-                causal=causal,
-            )
+            out = reference()
         else:
             # CUDA picks a kernel version per head size; the XPU kernel is FA2
             # and ignores the argument.
             fa_version = _resolve_fa_version(query_flat.shape[-1]) if device_type == "cuda" else 2
 
             out = torch.empty_like(query_flat)
-            result = fa_utils.flash_attn_varlen_func(
-                q=query_flat,
-                k=key_cache,
-                v=value_cache,
-                out=out,
-                cu_seqlens_q=query_start_loc,
-                max_seqlen_q=int(max_query_len),
-                seqused_k=seq_lens,
-                max_seqlen_k=int(max_seq_len),
-                softmax_scale=float(softmax_scale),
-                causal=causal,
-                block_table=block_table,
-                fa_version=fa_version,
-            )
-            # The two kernels differ on the output contract: CUDA writes into
-            # `out` and returns it (or a tuple), XPU returns its own tensor.
-            # Prefer whatever was returned and keep `out` as the fallback.
-            if isinstance(result, (tuple, list)):
-                result = result[0] if result else None
-            if result is not None:
-                out = result
-            ar_diffusion_paged_attention_backend = device_type
+            try:
+                result = fa_utils.flash_attn_varlen_func(
+                    q=query_flat,
+                    k=key_cache,
+                    v=value_cache,
+                    out=out,
+                    cu_seqlens_q=query_start_loc,
+                    max_seqlen_q=int(max_query_len),
+                    seqused_k=seq_lens,
+                    max_seqlen_k=int(max_seq_len),
+                    softmax_scale=float(softmax_scale),
+                    causal=causal,
+                    block_table=block_table,
+                    fa_version=fa_version,
+                )
+            except RuntimeError as exc:
+                # Re-raises unless this is the XPU kernel refusing the page size.
+                _record_rejected_page_size(device_type, page_size, exc)
+                ar_diffusion_paged_attention_backend = "reference"
+                out = reference()
+            else:
+                # The two kernels differ on the output contract: CUDA writes into
+                # `out` and returns it (or a tuple), XPU returns its own tensor.
+                # Prefer whatever was returned and keep `out` as the fallback.
+                if isinstance(result, (tuple, list)):
+                    result = result[0] if result else None
+                if result is not None:
+                    out = result
+                ar_diffusion_paged_attention_backend = device_type
 
     if batched:
         return out.reshape(query.shape)

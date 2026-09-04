@@ -182,3 +182,80 @@ def test_cpu_uses_reference_backend():
     out = _call(q, kc, vc, bt, qsl, sl)
     assert out.shape == q.shape
     assert pa.ar_diffusion_paged_attention_backend == "reference"
+
+
+def test_xpu_page_size_refusal_falls_back_and_is_remembered(monkeypatch):
+    """A kernel that refuses the page size must degrade loudly, not abort.
+
+    ``is_flash_attn_varlen_func_available()`` reports True on XPU unconditionally --
+    it answers "is an entry point bound", not "can it service this geometry". The
+    page-size check lives in the kernel's C++ and raises from there, so without this
+    path a build that refuses DreamZero's frame-length page turns a working (if slow)
+    XPU run into a hard abort, and the env-var escape hatch never even runs.
+
+    The refusal is recorded, so later calls skip the failed dispatch entirely rather
+    than paying it once per layer per step.
+    """
+    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
+    monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
+    page_size = kc.shape[1]
+
+    calls = {"kernel": 0}
+
+    def refusing_fa(**kwargs):
+        calls["kernel"] += 1
+        raise RuntimeError(f"chunk_prefill: unsupported block_size={page_size} (supported: 16, 32, ...)")
+
+    with (
+        patch("torch.version.hip", None),
+        patch(_FA_FUNC, side_effect=refusing_fa, create=True),
+        patch(_FA_AVAILABLE, return_value=True),
+    ):
+        first = _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
+        assert pa.ar_diffusion_paged_attention_backend == "reference"
+        assert first.shape == q.shape
+        assert page_size in pa._XPU_REJECTED_PAGE_SIZES
+
+        second = _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
+
+    assert calls["kernel"] == 1, "the refused page size should not be retried per call"
+    assert second.shape == q.shape
+    assert pa.ar_diffusion_paged_attention_backend == "reference"
+
+
+def test_unrelated_kernel_errors_still_propagate(monkeypatch):
+    """Only the page-size complaint is absorbed; real failures must not be hidden."""
+    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
+    monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
+
+    def exploding_fa(**kwargs):
+        raise RuntimeError("XPU out of memory")
+
+    with (
+        patch("torch.version.hip", None),
+        patch(_FA_FUNC, side_effect=exploding_fa, create=True),
+        patch(_FA_AVAILABLE, return_value=True),
+    ):
+        with pytest.raises(RuntimeError, match="out of memory"):
+            _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
+
+    assert pa._XPU_REJECTED_PAGE_SIZES == set()
+
+
+def test_cuda_page_size_errors_are_not_absorbed(monkeypatch):
+    """The refusal path is XPU-only; CUDA has no such page-size constraint."""
+    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
+    monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
+
+    def refusing_fa(**kwargs):
+        raise RuntimeError("chunk_prefill: unsupported block_size=880")
+
+    with (
+        patch("torch.version.hip", None),
+        patch(_FA_FUNC, side_effect=refusing_fa, create=True),
+        patch(_FA_AVAILABLE, return_value=True),
+    ):
+        with pytest.raises(RuntimeError, match="unsupported block_size"):
+            _call(_FakeDeviceTensor.make(q, "cuda"), kc, vc, bt, qsl, sl)
+
+    assert pa._XPU_REJECTED_PAGE_SIZES == set()

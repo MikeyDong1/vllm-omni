@@ -62,6 +62,14 @@ class DreamZeroPayloadError(ValueError):
     """A cross-stage payload is absent, malformed, or of the wrong boundary."""
 
 
+class DreamZeroStaleRequestError(ValueError):
+    """A payload is stale, duplicated, out of order, or from a fenced epoch.
+
+    Raised by the committed-progress authority *before* any model or KV mutation,
+    so a rejected request cannot corrupt a live AR-Diffusion session.
+    """
+
+
 def _reject_opaque(where: str, name: str, value: Any) -> None:
     if isinstance(value, (torch.nn.Module, torch.device, torch.Generator, FunctionType, MethodType)):
         raise DreamZeroPayloadError(

@@ -1010,13 +1010,13 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.model_path_resolver:
+        engine_args["model_path_resolver"] = ps.model_path_resolver
+    engine_args["inline_diffusion"] = ps.inline_diffusion
     if ps.stage_input_payload_keys:
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
-    if ps.model_path_resolver:
-        engine_args["model_path_resolver"] = ps.model_path_resolver
-    engine_args["inline_diffusion"] = ps.inline_diffusion
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:

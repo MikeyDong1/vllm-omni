@@ -25,6 +25,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.cache.stepcache import (
     get_stepcache_state,
     is_stepcache_active,
@@ -53,6 +54,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SEED,
     DEFAULT_SIGMA_SHIFT,
 )
+from vllm_omni.diffusion.models.interface import role_loads_component
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -127,8 +129,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     state: DreamZeroSessionState | None
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        """Describe DreamZero's local KV geometry to the generic runner."""
+        """Describe DreamZero's local KV geometry to the generic runner.
+
+        Only the DiT-owning roles (FULL / DENOISE) reach this: AR-Diffusion KV
+        exists solely where the denoise loop runs.
+        """
         transformer = self.transformer
+        if transformer is None:
+            raise RuntimeError(
+                f"AR-Diffusion KV geometry requested on a {self.stage_role.value!r} stage, "
+                "which does not own the DiT. Only the full or denoise stage runs "
+                "under the AR-Diffusion engine."
+            )
         frame_tokens = int(transformer.frame_seqlen)
         max_attention_tokens = int(transformer.blocks[0].self_attn.max_attention_size)
         cfg_world = int(get_classifier_free_guidance_world_size())
@@ -368,15 +380,50 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """
         super().__init__()
 
-        # DreamZero is engine-only: every KV access in forward() routes through
-        # the AR-Diffusion engine's pool-backed state. Fail fast here — a stale
-        # or programmatic config that leaves engine_backend="default" would
-        # otherwise only crash mid-forward on the first KV access.
+        # ---- Stage role -------------------------------------------------
+        # ``resolve_diffusion_stage_role`` maps the structured ``stage_role``
+        # (falling back to the legacy free-form ``model_stage``) onto the shared
+        # ``DiffusionStageRole`` vocabulary. Monolithic deployments resolve to
+        # FULL and behave exactly as before.
+        #
+        # ``role_loads_component`` then decides which component groups this
+        # stage constructs. DreamZero reads the generic groups as:
+        #   "encoder" -> tokenizer + UMT5 + CLIP image encoder + VAE *encode*
+        #                path (the VAE module is an input encoder here, not an
+        #                output decoder)
+        #   "dit"     -> CausalWan DiT, denoise schedulers, action modules and
+        #                the AR-Diffusion paged KV geometry
+        #   "vae"     -> a VAE *decoder* for producing RGB output, which
+        #                DreamZero's trailing stage does not use: it emits
+        #                normalized video latents plus actions, so the decode
+        #                stage deliberately loads no VAE at all.
+        # Components are pruned before construction, not merely skipped at call
+        # time, so a disaggregated worker never pays their memory cost.
+        self.stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None),
+            getattr(od_config, "model_stage", None),
+        )
+        role = self.stage_role.value
+        self._load_encoders = role_loads_component(role, "encoder")
+        self._load_dit = role_loads_component(role, "dit")
+        # The VAE lives with the encode path (observation encoding); the decode
+        # stage needs neither the module nor its weights.
+        self._load_vae = self._load_encoders
+        # Frame history, the VAE encoder stream, prompt-embed caches and AR
+        # progress are all per-session. The trailing decode stage is stateless.
+        self._holds_session_state = self._load_encoders or self._load_dit
+
+        # Only the DiT-owning roles touch AR-Diffusion KV, and only they need the
+        # AR-Diffusion engine. Fail fast there — a stale or programmatic config
+        # that leaves engine_backend="default" would otherwise only crash
+        # mid-forward on the first KV access. Encode/decode stages run on the
+        # plain diffusion engine and must not require the AR backend.
         engine_backend = str(getattr(od_config, "engine_backend", "") or "")
-        if "ar_diffusion" not in engine_backend.lower().replace("-", "_"):
+        if self._load_dit and "ar_diffusion" not in engine_backend.lower().replace("-", "_"):
             raise ValueError(
-                "DreamZeroPipeline requires the AR-Diffusion engine; set "
-                "engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine "
+                "DreamZeroPipeline requires the AR-Diffusion engine for its "
+                f"{role!r} stage; set engine_backend: "
+                "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine "
                 f"in the deploy config (got engine_backend={engine_backend!r})."
             )
 
@@ -397,74 +444,93 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         ah_config = action_head_cfg["config"]
         diffusion_model_cfg = ah_config["diffusion_model_cfg"]
 
-        # ---- Tokenizer ----
-        tokenizer_source = od_config.model_paths.get("tokenizer", "google/umt5-xxl")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+        # ---- Tokenizer + text/image encoders (encode-side components) ----
+        if self._load_encoders:
+            tokenizer_source = od_config.model_paths.get("tokenizer", "google/umt5-xxl")
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
 
-        # Instantiate from config; weights load through `load_weights()`.
-        umt5_config = UMT5Config(
-            d_model=4096,
-            d_ff=10240,
-            num_heads=64,
-            num_layers=24,
-            vocab_size=256384,
-            relative_attention_num_buckets=32,
-            relative_attention_max_distance=128,
-            dense_act_fn="gelu_new",
-            feed_forward_proj="gated-gelu",
-            is_encoder_decoder=False,
-        )
-        self.text_encoder = UMT5EncoderModel(umt5_config)
+            # Instantiate from config; weights load through `load_weights()`.
+            umt5_config = UMT5Config(
+                d_model=4096,
+                d_ff=10240,
+                num_heads=64,
+                num_layers=24,
+                vocab_size=256384,
+                relative_attention_num_buckets=32,
+                relative_attention_max_distance=128,
+                dense_act_fn="gelu_new",
+                feed_forward_proj="gated-gelu",
+                is_encoder_decoder=False,
+            )
+            self.text_encoder = UMT5EncoderModel(umt5_config)
 
-        self.image_encoder = DreamZeroImageEncoder()
+            self.image_encoder = DreamZeroImageEncoder()
+        else:
+            self.tokenizer = None
+            self.text_encoder = None
+            self.image_encoder = None
 
         # Build a compatible VAE module, then fill it through `load_weights()`.
-        vae_source = od_config.model_paths.get("vae")
-        if vae_source:
-            self.vae = DistributedAutoencoderKLWan.from_pretrained(
-                vae_source,
-                torch_dtype=torch.float32,
+        if self._load_vae:
+            vae_source = od_config.model_paths.get("vae")
+            if vae_source:
+                self.vae = DistributedAutoencoderKLWan.from_pretrained(
+                    vae_source,
+                    torch_dtype=torch.float32,
+                )
+            elif local_files_only and os.path.isdir(os.path.join(model_path, "vae")):
+                self.vae = DistributedAutoencoderKLWan.from_pretrained(
+                    model_path,
+                    subfolder="vae",
+                    torch_dtype=torch.float32,
+                )
+            else:
+                self.vae = DistributedAutoencoderKLWan()
+                self.vae.init_distributed()
+            if not (
+                getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
+            ):
+                self.vae = self.vae.to(device=get_local_device(), dtype=od_config.dtype)
+            self.register_buffer(
+                "vae_latents_mean",
+                torch.tensor(self.vae.config.latents_mean, dtype=torch.float32).view(1, -1, 1, 1, 1),
+                persistent=False,
             )
-        elif local_files_only and os.path.isdir(os.path.join(model_path, "vae")):
-            self.vae = DistributedAutoencoderKLWan.from_pretrained(
-                model_path,
-                subfolder="vae",
-                torch_dtype=torch.float32,
+            self.register_buffer(
+                "vae_latents_inv_std",
+                (1.0 / torch.tensor(self.vae.config.latents_std, dtype=torch.float32)).view(1, -1, 1, 1, 1),
+                persistent=False,
             )
         else:
-            self.vae = DistributedAutoencoderKLWan()
-            self.vae.init_distributed()
-        if not (
-            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-        ):
-            self.vae = self.vae.to(device=get_local_device(), dtype=od_config.dtype)
-        self.register_buffer(
-            "vae_latents_mean",
-            torch.tensor(self.vae.config.latents_mean, dtype=torch.float32).view(1, -1, 1, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "vae_latents_inv_std",
-            (1.0 / torch.tensor(self.vae.config.latents_std, dtype=torch.float32)).view(1, -1, 1, 1, 1),
-            persistent=False,
-        )
+            self.vae = None
 
-        # Filter out keys not accepted by `CausalWanModel.__init__`.
-        transformer_kwargs = {k: v for k, v in diffusion_model_cfg.items() if k not in ("_convert_", "_target_")}
-        transformer_kwargs["action_dim"] = ah_config["action_dim"]
-        transformer_kwargs["max_state_dim"] = ah_config["max_state_dim"]
-        transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
-        self.transformer = CausalWanModel(**transformer_kwargs)
+        # ---- CausalWan DiT + denoise schedulers (denoise-side components) ----
+        if self._load_dit:
+            # Filter out keys not accepted by `CausalWanModel.__init__`.
+            transformer_kwargs = {k: v for k, v in diffusion_model_cfg.items() if k not in ("_convert_", "_target_")}
+            transformer_kwargs["action_dim"] = ah_config["action_dim"]
+            transformer_kwargs["max_state_dim"] = ah_config["max_state_dim"]
+            transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
+            self.transformer = CausalWanModel(**transformer_kwargs)
 
-        self.scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=1,
-            use_dynamic_shifting=False,
-        )
+            self.scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=1000,
+                shift=1,
+                use_dynamic_shifting=False,
+            )
+        else:
+            self.transformer = None
+            self.scheduler = None
 
         # Read before the first `_get_or_create_state` below: the manager-backed
         # state bounds its VAE encoder history to this many latent frames.
         self.num_frame_per_block: int = ah_config["num_frame_per_block"]
+        self.action_dim: int = ah_config["action_dim"]
+        # Attention-window size, derived exactly as ``CausalWanModel`` does. The
+        # encode stage needs it to decide when the session's window rolls over
+        # without owning the DiT; the DiT stage keeps reading it off the module.
+        max_chunk_size = int(diffusion_model_cfg.get("max_chunk_size", -1))
+        self.local_attn_size: int = max_chunk_size * self.num_frame_per_block + 1 if max_chunk_size != -1 else -1
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         # Opt-in: back per-session state with the shared SessionStateManager
@@ -478,7 +544,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         if self._use_memory_manager:
             logger.info("DreamZero: session state manager enabled (max_sessions=%d)", mm_max_sessions)
-        self.state = self._get_or_create_state("default")
+        # The decode stage is stateless postprocess: no frame history, no VAE
+        # encoder stream, no KV. Every other role keeps stage-local session state.
+        self.state = self._get_or_create_state("default") if self._holds_session_state else None
 
         # DiT step cache is configured by StepCacheBackend
         # (cache_backend="step_cache") via pipeline._stepcache_config.
@@ -531,19 +599,26 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # Number of action dims that are relative (DROID: 7 = joint only, gripper is absolute)
         self.relative_action_dim: int = model_config.get("relative_action_dim", 7)
 
-        self._weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=model_path,
-                subfolder=None,
-                revision=None,
-                prefix="",
-                fall_back_to_pt=False,
-                allow_patterns_overrides=[
-                    "model-*.safetensors",
-                    "model.safetensors",
-                ],
-            ),
-        ]
+        # A decode-only stage builds no torch modules, so it must not pull the
+        # root safetensors shards at all -- reading a 14B checkpoint to load
+        # nothing is exactly the cost disaggregation is meant to avoid.
+        self._weights_sources = (
+            [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model_path,
+                    subfolder=None,
+                    revision=None,
+                    prefix="",
+                    fall_back_to_pt=False,
+                    allow_patterns_overrides=[
+                        "model-*.safetensors",
+                        "model.safetensors",
+                    ],
+                ),
+            ]
+            if (self._load_encoders or self._load_dit)
+            else []
+        )
 
     def _get_or_create_state(self, session_id: str | None) -> DreamZeroState | DreamZeroStateAdapter:
         # getattr guards lightweight test fixtures that build the pipeline via
@@ -665,6 +740,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         apply_wan_vae_feat_cache_tensor_patch()
 
         compile_ro = {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
+        # Each stage compiles only the components it constructed.
+        compile_encoders = self._load_encoders
+        compile_dit = self._load_dit
         # DiT blocks: default avoids CUDAGraph overwrite on modulation tensors; encoders use reduce-overhead.
         # The AR-Diffusion paged self-attention is a registered custom op, so the
         # block stays fullgraph even on that path.
@@ -674,36 +752,38 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             "DreamZero: torch.compile text/image/VAE encode + per-block DiT (encoders reduce-overhead, DiT default)."
         )
 
-        try:
-            self.text_encoder.forward = torch.compile(self.text_encoder.forward, **compile_ro)
-        except Exception as exc:
-            logger.warning("DreamZero: text_encoder compile failed (%s); skipping.", exc)
+        if compile_encoders:
+            try:
+                self.text_encoder.forward = torch.compile(self.text_encoder.forward, **compile_ro)
+            except Exception as exc:
+                logger.warning("DreamZero: text_encoder compile failed (%s); skipping.", exc)
 
-        try:
-            self.image_encoder.model.visual.forward = torch.compile(
-                self.image_encoder.model.visual.forward,
-                **compile_ro,
-            )
-        except Exception as exc:
-            logger.warning("DreamZero: image_encoder compile failed (%s); skipping.", exc)
+            try:
+                self.image_encoder.model.visual.forward = torch.compile(
+                    self.image_encoder.model.visual.forward,
+                    **compile_ro,
+                )
+            except Exception as exc:
+                logger.warning("DreamZero: image_encoder compile failed (%s); skipping.", exc)
 
-        try:
-            self.vae._encode = torch.compile(self.vae._encode, **compile_ro)
-        except Exception as exc:
-            logger.warning("DreamZero: vae._encode compile failed (%s); skipping.", exc)
+            try:
+                self.vae._encode = torch.compile(self.vae._encode, **compile_ro)
+            except Exception as exc:
+                logger.warning("DreamZero: vae._encode compile failed (%s); skipping.", exc)
 
         compiled_blocks = 0
-        for block in self.transformer.blocks:
-            try:
-                block.forward = torch.compile(block.forward, **dit_compile)
-                compiled_blocks += 1
-            except Exception as exc:
-                logger.warning(
-                    "DreamZero: transformer block %d compile failed (%s); leaving remaining eager.",
-                    compiled_blocks,
-                    exc,
-                )
-                break
+        if compile_dit:
+            for block in self.transformer.blocks:
+                try:
+                    block.forward = torch.compile(block.forward, **dit_compile)
+                    compiled_blocks += 1
+                except Exception as exc:
+                    logger.warning(
+                        "DreamZero: transformer block %d compile failed (%s); leaving remaining eager.",
+                        compiled_blocks,
+                        exc,
+                    )
+                    break
         if compiled_blocks:
             logger.info(
                 "DreamZero: compiled %d/%d transformer blocks.",
@@ -716,6 +796,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def warmup_compile(self) -> None:
         """Warm up compiled text/image/VAE paths before timed inference."""
         if not torch.cuda.is_available():
+            return
+        if not self._load_encoders:
+            # Nothing warmed up here is owned by a denoise- or decode-only stage.
             return
 
         state = self.state
@@ -1051,6 +1134,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def decode_video_latents(self, video_latents: torch.Tensor) -> torch.Tensor:
         """Decode normalized VAE latents into RGB video tensors."""
+        if self.vae is None:
+            raise RuntimeError(
+                f"decode_video_latents requires the VAE, which a {self.stage_role.value!r} "
+                "stage does not construct. DreamZero's disaggregated output is "
+                "normalized video latents; decode them on a VAE-carrying stage."
+            )
         vae_dtype = self.vae.dtype
         vae_device = next(self.vae.parameters()).device
         latents = video_latents.to(device=vae_device, dtype=vae_dtype)

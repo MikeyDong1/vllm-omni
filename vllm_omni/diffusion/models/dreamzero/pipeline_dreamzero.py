@@ -43,6 +43,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.dreamzero.causal_wan_model import CausalWanModel
 from vllm_omni.diffusion.models.dreamzero.image_encoder import DreamZeroImageEncoder
 from vllm_omni.diffusion.models.dreamzero.payload_dreamzero import (
+    DreamZeroPayloadError,
     DreamZeroStagePayload,
     DreamZeroStaleRequestError,
     get_incoming_stage_payload,
@@ -2033,10 +2034,28 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if dummy is not None:
             return dummy
         payload = self._unpack_stage_payload(batch, DREAMZERO_BOUNDARY_DIT_TO_DECODE)
+        private = payload.private_scalar_fields
+        # Both of these silently change the numbers if they go missing -- an
+        # absent embodiment skips q99 denormalization, and an absent observation
+        # state leaves relative joint targets relative -- so require them
+        # explicitly rather than defaulting.
+        embodiment_name = private.get("embodiment_name")
+        if not embodiment_name:
+            raise DreamZeroPayloadError(
+                "DreamZero decode payload carries no 'embodiment_name'; action "
+                "denormalization statistics are selected by embodiment and cannot be guessed."
+            )
+        last_state = payload.private_tensor_fields.get("last_state")
+        if bool(private.get("has_observation_state")) != (last_state is not None):
+            raise DreamZeroPayloadError(
+                "DreamZero decode payload disagrees about the observation state: "
+                f"has_observation_state={private.get('has_observation_state')!r} but "
+                f"last_state is {'present' if last_state is not None else 'absent'}."
+            )
         meta = _DreamZeroPostprocessMeta(
-            embodiment_name=str(payload.private_scalar_fields.get("embodiment_name", "")),
-            embodiment_key=str(payload.private_scalar_fields.get("embodiment_key") or self.default_robot_embodiment),
-            last_state=payload.private_tensor_fields.get("last_state"),
+            embodiment_name=str(embodiment_name),
+            embodiment_key=str(private.get("embodiment_key") or self.default_robot_embodiment),
+            last_state=last_state,
         )
         denoised = _DreamZeroDenoised(
             video_latents=payload.tensor("video_latents"),
@@ -2144,6 +2163,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             private_scalar_fields={
                 "embodiment_name": enc.postprocess_meta.embodiment_name,
                 "embodiment_key": enc.postprocess_meta.embodiment_key,
+                # Explicit so the decode stage can tell "this request had no
+                # observation state" apart from "the state was lost in transit".
+                "has_observation_state": enc.postprocess_meta.last_state is not None,
             },
             private_tensor_fields=private_tensor_fields,
         )

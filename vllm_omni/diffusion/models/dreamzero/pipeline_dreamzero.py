@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.dreamzero.causal_wan_model import CausalWanModel
 from vllm_omni.diffusion.models.dreamzero.image_encoder import DreamZeroImageEncoder
 from vllm_omni.diffusion.models.dreamzero.payload_dreamzero import (
     DreamZeroStagePayload,
+    DreamZeroStaleRequestError,
     get_incoming_stage_payload,
 )
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
@@ -127,6 +128,28 @@ class VideoActionScheduler:
 
 
 @dataclass
+class _DreamZeroSessionProgress:
+    """Per-session AR ordering bookkeeping, kept independently by each stage.
+
+    The encode stage owns *issue* order: it stamps every request it emits. The
+    denoise stage owns *committed* order: it advances only after the denoise loop
+    and the KV commit for that chunk have succeeded. A reset opens a new epoch,
+    which fences every request still in flight from the previous one.
+    """
+
+    epoch: int = 0
+    sequence: int = 0
+    attempt: int = 0
+
+
+@dataclass
+class _DreamZeroAuthorization:
+    """Outcome of the committed-progress check for one incoming payload."""
+
+    new_epoch: bool
+
+
+@dataclass
 class _DreamZeroPostprocessMeta:
     """Metadata the postprocess phase needs, produced by the encode phase.
 
@@ -147,6 +170,9 @@ class _DreamZeroEncoded:
     reset_reason: str | None
     window_start: bool
     current_start_frame: int
+    epoch: int
+    sequence: int
+    attempt: int
     frame_seqlen: int
     seq_len: int
     do_true_cfg: bool
@@ -254,6 +280,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
         """Remove model state and clear the compatibility alias when it points there."""
         key = str(session_id or "default")
+        # The session's AR ordering dies with the session: a later session that
+        # reuses the id starts a fresh epoch rather than inheriting old progress.
+        for progress in (
+            getattr(self, "_issued_progress", None),
+            getattr(self, "_committed_progress", None),
+        ):
+            if progress is not None:
+                progress.pop(key, None)
         # Local binding narrows the Optional and guards lightweight test fixtures
         # that build the pipeline via __new__ without setting _memory_manager.
         manager = getattr(self, "_memory_manager", None)
@@ -388,6 +422,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 "reset_reason": None,
                 "window_start": window_start,
                 "current_start_frame": 0 if window_start else 1 + (index - 1) * nfpb,
+                # Warmup issues one clean epoch of consecutive chunks.
+                "epoch": 1,
+                "sequence": index + 1,
+                "attempt": 0,
                 "frame_seqlen": frame_seqlen,
                 "seq_len": frame_seqlen * nfpb,
                 "do_true_cfg": self.cfg_scale > 1.0,
@@ -672,6 +710,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # without owning the DiT; the DiT stage keeps reading it off the module.
         max_chunk_size = int(diffusion_model_cfg.get("max_chunk_size", -1))
         self.local_attn_size: int = max_chunk_size * self.num_frame_per_block + 1 if max_chunk_size != -1 else -1
+
+        # AR ordering bookkeeping. Each stage keeps only the half it owns: the
+        # encode stage stamps issue order, the denoise stage records committed
+        # progress. They are separate dicts so a single-process FULL deployment
+        # exercises the same authorization path as the split one.
+        self._issued_progress: dict[str, _DreamZeroSessionProgress] = {}
+        self._committed_progress: dict[str, _DreamZeroSessionProgress] = {}
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         # Opt-in: back per-session state with the shared SessionStateManager
@@ -1618,8 +1663,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return encoded
 
         state = self._get_or_create_state(encoded.session_id)
-        self._apply_kv_reset(state, encoded.reset_reason)
+        authorization = self._authorize_stage_progress(encoded, state)
+        if authorization.new_epoch:
+            self._fence_session_epoch(state)
+        else:
+            self._apply_kv_reset(state, encoded.reset_reason)
         denoised = self._denoise_phase(encoded, state=state)
+        self._commit_stage_progress(encoded)
         return self._postprocess_phase(encoded.postprocess_meta, denoised)
 
     # -- Stage 0: encode ------------------------------------------------------
@@ -1657,6 +1707,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             raise KeyError("robot_obs")
 
         session_id = str(extra_args.get("session_id") or "default")
+        explicit_reset = bool(extra_args.get("reset", False))
         state = self._get_or_create_state(session_id)
         self.state = state
         embodiment_key = str(robot_obs.get("embodiment", self.default_robot_embodiment))
@@ -1724,6 +1775,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         elif reset_reason == "inference":
             state.reset(clear_video_latents=False)
         state.language = text_tokens
+
+        # Stamp issue order. A session reset -- explicit from the request or
+        # detected from a prompt change -- opens a new epoch, which fences every
+        # request still in flight from the previous one. A window ("inference")
+        # reset continues the same session and keeps the epoch.
+        epoch, sequence, attempt = self._next_issue_progress(
+            session_id,
+            new_epoch=explicit_reset or reset_reason == "session",
+        )
 
         # Frame accumulation: stitched single frame -> multi-frame video
         video_frames = state.accumulate_frames(stitched)  # (T, H, W, C)
@@ -1818,6 +1878,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             reset_reason=reset_reason,
             window_start=window_start,
             current_start_frame=int(state.current_start_frame),
+            epoch=epoch,
+            sequence=sequence,
+            attempt=attempt,
             frame_seqlen=frame_seqlen,
             seq_len=seq_len,
             do_true_cfg=do_true_cfg,
@@ -1853,10 +1916,23 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return dummy
         payload = self._unpack_stage_payload(batch, DREAMZERO_BOUNDARY_ENCODE_TO_DIT)
         encoded, session_id = self._encoded_from_payload(payload)
+        if self._ar_diffusion_kv_state is None:
+            raise RuntimeError(
+                "DreamZero denoise stage ran without a bound AR-Diffusion session; "
+                "the stage must run on the AR-Diffusion engine."
+            )
         state = self._get_or_create_state(session_id)
         self.state = state
-        self._apply_kv_reset(state, encoded.reset_reason)
+        # Authorize before binding conditioning or resetting anything.
+        authorization = self._authorize_stage_progress(encoded, state)
+        if authorization.new_epoch:
+            self._fence_session_epoch(state)
+        else:
+            self._apply_kv_reset(state, encoded.reset_reason)
         denoised = self._denoise_phase(encoded, state=state)
+        # Progress advances only now: a failed denoise or KV commit raises above
+        # and leaves committed progress untouched.
+        self._commit_stage_progress(encoded)
         out_payload = self._pack_denoise_payload(payload, denoised)
         return DiffusionOutput(output=None, custom_output=out_payload.as_custom_output(), to_cpu=True)
 
@@ -2054,6 +2130,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 "reset_reason": enc.reset_reason,
                 "window_start": bool(enc.window_start),
                 "current_start_frame": int(enc.current_start_frame),
+                # Issue-order metadata the denoise stage authorizes against its
+                # own committed progress before touching the model or the KV pool.
+                "epoch": int(enc.epoch),
+                "sequence": int(enc.sequence),
+                "attempt": int(enc.attempt),
                 "frame_seqlen": int(enc.frame_seqlen),
                 "seq_len": int(enc.seq_len),
                 "do_true_cfg": bool(enc.do_true_cfg),
@@ -2078,6 +2159,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             reset_reason=payload.scalar("reset_reason", None),
             window_start=bool(payload.scalar("window_start")),
             current_start_frame=int(payload.scalar("current_start_frame")),
+            epoch=int(payload.scalar("epoch")),
+            sequence=int(payload.scalar("sequence")),
+            attempt=int(payload.scalar("attempt")),
             frame_seqlen=int(payload.scalar("frame_seqlen")),
             seq_len=int(payload.scalar("seq_len")),
             do_true_cfg=bool(payload.scalar("do_true_cfg")),
@@ -2117,6 +2201,90 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
     # -- Shared helpers -------------------------------------------------------
+
+    def _next_issue_progress(self, session_id: str, *, new_epoch: bool) -> tuple[int, int, int]:
+        """Stamp and return the issue-order metadata for one outgoing request."""
+        progress = self._issued_progress.setdefault(session_id, _DreamZeroSessionProgress())
+        if new_epoch:
+            progress.epoch += 1
+            progress.sequence = 0
+        progress.sequence += 1
+        # DreamZero has no request-level retry today; the field is carried so a
+        # retry can be distinguished from a duplicate without a schema change.
+        progress.attempt = 0
+        return progress.epoch, progress.sequence, progress.attempt
+
+    def _authorize_stage_progress(
+        self,
+        enc: _DreamZeroEncoded,
+        state: DreamZeroSessionState,
+    ) -> _DreamZeroAuthorization:
+        """Authorize an incoming chunk against committed progress.
+
+        Runs before the KV reset and before any model or KV mutation, so a
+        stale, duplicated, out-of-order or fenced request is refused rather than
+        half-applied to a live AR-Diffusion session.
+        """
+        committed = self._committed_progress.setdefault(enc.session_id, _DreamZeroSessionProgress())
+
+        if enc.epoch < committed.epoch:
+            raise DreamZeroStaleRequestError(
+                f"DreamZero session {enc.session_id!r} chunk from epoch {enc.epoch} was fenced "
+                f"by epoch {committed.epoch}; a reset has since started a new session."
+            )
+
+        new_epoch = enc.epoch > committed.epoch
+        if new_epoch:
+            if enc.sequence != 1:
+                raise DreamZeroStaleRequestError(
+                    f"DreamZero session {enc.session_id!r} opens epoch {enc.epoch} at sequence "
+                    f"{enc.sequence}; a new epoch must start at sequence 1."
+                )
+            committed.epoch = enc.epoch
+            committed.sequence = 0
+            committed.attempt = 0
+        elif enc.sequence <= committed.sequence:
+            raise DreamZeroStaleRequestError(
+                f"DreamZero session {enc.session_id!r} chunk {enc.sequence} is a duplicate or "
+                f"stale replay; committed progress is already at {committed.sequence}."
+            )
+        elif enc.sequence != committed.sequence + 1:
+            raise DreamZeroStaleRequestError(
+                f"DreamZero session {enc.session_id!r} chunk {enc.sequence} leaves a gap after "
+                f"committed chunk {committed.sequence}; AR-Diffusion KV cannot skip a chunk."
+            )
+
+        # A reset (of either kind) defines the new window position, so only a
+        # continuing chunk has to agree with the committed one.
+        if not new_epoch and enc.reset_reason is None:
+            local_start_frame = int(state.current_start_frame)
+            if enc.current_start_frame != local_start_frame:
+                raise DreamZeroStaleRequestError(
+                    f"DreamZero session {enc.session_id!r} chunk starts at frame "
+                    f"{enc.current_start_frame} but this stage's committed window is at "
+                    f"{local_start_frame}; the stages have diverged."
+                )
+
+        return _DreamZeroAuthorization(new_epoch=new_epoch)
+
+    def _commit_stage_progress(self, enc: _DreamZeroEncoded) -> None:
+        """Record committed progress once the chunk's denoise and KV commit ran."""
+        committed = self._committed_progress.setdefault(enc.session_id, _DreamZeroSessionProgress())
+        committed.epoch = enc.epoch
+        committed.sequence = enc.sequence
+        committed.attempt = enc.attempt
+
+    def _fence_session_epoch(self, state: DreamZeroSessionState) -> None:
+        """Drop the previous epoch's window before the first chunk of a new one.
+
+        The AR runner already releases the session when a request carries
+        ``reset``, but the epoch stamp makes this stage self-sufficient: it
+        fences the old window even if it never saw that flag.
+        """
+        if self._ar_diffusion_kv_state is None:
+            state.reset(clear_video_latents=True)
+            return
+        self._kv_reset(state, clear_video_latents=True)
 
     def _apply_kv_reset(self, state: DreamZeroSessionState, reset_reason: str | None) -> None:
         """Apply the AR-Diffusion half of a reset on the stage that owns KV.

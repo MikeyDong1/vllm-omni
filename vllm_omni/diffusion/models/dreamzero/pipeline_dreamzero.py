@@ -17,6 +17,8 @@ import re as re_module
 from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -25,7 +27,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.config.stage_config import resolve_diffusion_stage_role
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.cache.stepcache import (
     get_stepcache_state,
     is_stepcache_active,
@@ -40,6 +42,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dreamzero.causal_wan_model import CausalWanModel
 from vllm_omni.diffusion.models.dreamzero.image_encoder import DreamZeroImageEncoder
+from vllm_omni.diffusion.models.dreamzero.payload_dreamzero import (
+    DreamZeroStagePayload,
+    get_incoming_stage_payload,
+)
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
 from vllm_omni.diffusion.models.dreamzero.transform import (
     DEFAULT_EMBODIMENT,
@@ -53,6 +59,9 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_NUM_INFERENCE_STEPS,
     DEFAULT_SEED,
     DEFAULT_SIGMA_SHIFT,
+    DREAMZERO_BOUNDARY_DIT_TO_DECODE,
+    DREAMZERO_BOUNDARY_ENCODE_TO_DIT,
+    DREAMZERO_STAGE_PAYLOAD_KEY,
 )
 from vllm_omni.diffusion.models.interface import role_loads_component
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
@@ -106,6 +115,60 @@ class VideoActionScheduler:
             generator=generator,
         )[0]
         return ((video_out, action_out),)
+
+
+# ---------------------------------------------------------------------------
+# In-process phase results
+#
+# These are the *internal* handoff types between the encode, denoise and
+# postprocess phase helpers. They never reach a transport: crossing a stage edge
+# goes through ``DreamZeroStagePayload``, which degrades to a plain nested dict.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _DreamZeroPostprocessMeta:
+    """Metadata the postprocess phase needs, produced by the encode phase.
+
+    The denoise stage forwards these untouched, which is why they travel in the
+    payload's ``private_*`` groups.
+    """
+
+    embodiment_name: str
+    embodiment_key: str
+    last_state: torch.Tensor | None = None
+
+
+@dataclass
+class _DreamZeroEncoded:
+    """Everything the denoise phase consumes from the encode phase."""
+
+    session_id: str
+    reset_reason: str | None
+    window_start: bool
+    current_start_frame: int
+    frame_seqlen: int
+    seq_len: int
+    do_true_cfg: bool
+    prompt_embeds: torch.Tensor
+    negative_prompt_embeds: torch.Tensor | None
+    clip_feas: torch.Tensor
+    ys: torch.Tensor
+    image_latents: torch.Tensor
+    noise_obs: torch.Tensor
+    noise_action: torch.Tensor
+    state_features: torch.Tensor | None
+    embodiment_id: torch.Tensor
+    postprocess_meta: _DreamZeroPostprocessMeta
+    phase_timing: dict | None = None
+
+
+@dataclass
+class _DreamZeroDenoised:
+    """Denoise-phase result: normalized video latents plus raw actions."""
+
+    video_latents: torch.Tensor
+    actions: torch.Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -243,20 +306,94 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         policy_config = self.od_config.model_config.get("policy_server_config", {})
         height, width = (int(value) for value in policy_config.get("image_resolution", [180, 320]))
         for index in range(n_forwards):
-            n_frames = 1 if index == 0 else 4
-            robot_obs = self._ar_warmup_robot_obs(height, width, n_frames, session_id)
-            sampling_params = OmniDiffusionSamplingParams(
-                extra_args={
-                    "reset": index == 0,
-                    "session_id": session_id,
-                    "robot_obs": robot_obs,
+            request_id = f"ardiffusion-warmup-{index}"
+            extra_args: dict[str, Any] = {
+                "reset": index == 0,
+                "session_id": session_id,
+            }
+            prompt: Any
+            if self._load_encoders:
+                # FULL role: the pipeline encodes the observation itself.
+                n_frames = 1 if index == 0 else 4
+                extra_args["robot_obs"] = self._ar_warmup_robot_obs(height, width, n_frames, session_id)
+                prompt = "warmup"
+            else:
+                # DENOISE role: the observation is encoded on another worker, so
+                # warm up the real denoise path with a synthesized upstream
+                # payload instead of an observation the stage cannot consume.
+                prompt = {
+                    "prompt": "warmup",
+                    DREAMZERO_STAGE_PAYLOAD_KEY: self._warmup_encode_payload(
+                        request_id=request_id,
+                        session_id=session_id,
+                        index=index,
+                        height=height,
+                        width=width,
+                    ).to_dict(),
                 }
-            )
             yield OmniDiffusionRequest(
-                prompt="warmup",
-                sampling_params=sampling_params,
-                request_id=f"ardiffusion-warmup-{index}",
+                prompt=prompt,
+                sampling_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+                request_id=request_id,
             )
+
+    def _warmup_encode_payload(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        index: int,
+        height: int,
+        width: int,
+    ) -> DreamZeroStagePayload:
+        """Synthesize the encode payload a DENOISE-stage warmup forward needs.
+
+        Shapes come from the checkpoint config and the deployed image resolution,
+        so warmup captures exactly the geometries a live rollout produces: the
+        window-start forward (a single reference latent frame) and the steady
+        -state forwards (a full ``num_frame_per_block`` observation window).
+        """
+        device = get_local_device()
+        dtype = torch.bfloat16
+        h_lat, w_lat = height // 8, width // 8
+        frame_seqlen = int(h_lat * w_lat / 4)
+        nfpb = self.num_frame_per_block
+        window_start = index == 0
+        latent_frames = (self.num_frames - 1) // 4 + 1
+
+        def zeros(*shape: int, tensor_dtype: torch.dtype = dtype) -> torch.Tensor:
+            return torch.zeros(*shape, device=device, dtype=tensor_dtype)
+
+        tensor_fields = {
+            "prompt_embeds": zeros(1, self.text_len, self.text_dim),
+            # ``msk`` (4 channels) concatenated with the VAE latents (16).
+            "ys": zeros(1, 20, latent_frames, h_lat, w_lat),
+            "clip_feas": zeros(1, 257, 1280),
+            "image_latents": zeros(1, 1 if window_start else nfpb, 16, h_lat, w_lat),
+            "noise_obs": zeros(1, nfpb, 16, h_lat, w_lat),
+            "noise_action": zeros(1, self.action_horizon, self.action_dim),
+            "state_features": zeros(1, 1, self.max_state_dim),
+            "embodiment_id": zeros(1, tensor_dtype=torch.long),
+        }
+        if self.cfg_scale > 1.0:
+            tensor_fields["negative_prompt_embeds"] = zeros(1, self.text_len, self.text_dim)
+
+        return DreamZeroStagePayload(
+            request_id=request_id,
+            boundary=DREAMZERO_BOUNDARY_ENCODE_TO_DIT,
+            scalar_fields={
+                "session_id": session_id,
+                # The runner already released the session for index 0, so no
+                # further reset is required here.
+                "reset_reason": None,
+                "window_start": window_start,
+                "current_start_frame": 0 if window_start else 1 + (index - 1) * nfpb,
+                "frame_seqlen": frame_seqlen,
+                "seq_len": frame_seqlen * nfpb,
+                "do_true_cfg": self.cfg_scale > 1.0,
+            },
+            tensor_fields=tensor_fields,
+        )
 
     def _ar_branch(self, is_negative: bool) -> str:
         return self._NEGATIVE_BRANCH if is_negative else self._POSITIVE_BRANCH
@@ -526,6 +663,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # state bounds its VAE encoder history to this many latent frames.
         self.num_frame_per_block: int = ah_config["num_frame_per_block"]
         self.action_dim: int = ah_config["action_dim"]
+        # Text conditioning geometry, read from the checkpoint config so a stage
+        # without a DiT can still describe the prompt-embedding shape.
+        self.text_len: int = int(diffusion_model_cfg.get("text_len", 512))
+        self.text_dim: int = int(diffusion_model_cfg.get("text_dim", 4096))
         # Attention-window size, derived exactly as ``CausalWanModel`` does. The
         # encode stage needs it to decide when the session's window rolls over
         # without owning the DiT; the DiT stage keeps reading it off the module.
@@ -1438,7 +1579,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return noisy_input, noisy_input_action
 
     # -----------------------------------------------------------------------
-    # Main entry point
+    # Stage dispatch and shared phase helpers
     # -----------------------------------------------------------------------
 
     def _transform_robot_obs(self, robot_obs: dict):
@@ -1447,30 +1588,79 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transform = get_transform(embodiment)
         return transform, transform.transform_input(robot_obs)
 
+    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
+        """Dispatch to the computation this pipeline's stage role owns.
+
+        Role dispatch is all this does; every bit of model math stays in the
+        shared phase helpers below, which the monolithic ``forward`` and the
+        three disaggregated stages call in the same order. The runner therefore
+        needs no knowledge of DreamZero, and a monolithic and a disaggregated
+        deployment run the same code.
+        """
+        if self.stage_role is DiffusionStageRole.ENCODE:
+            return self.encode_batch(batch)
+        if self.stage_role is DiffusionStageRole.DENOISE:
+            return self.denoise_batch(batch)
+        if self.stage_role is DiffusionStageRole.DECODE:
+            return self.decode_batch(batch)
+        return self.forward(batch)
+
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
-        """Full inference step. Called by DiffusionEngine.step_streaming()."""
+        """Full monolithic inference step (FULL role).
+
+        Identical to the pre-disaggregation behaviour, expressed as the three
+        phases the split stages run individually.
+        """
+        encoded = self._encode_phase(req)
+        if isinstance(encoded, DiffusionOutput):
+            # Dummy warmup request with no observation: nothing to denoise.
+            return encoded
+
+        state = self._get_or_create_state(encoded.session_id)
+        self._apply_kv_reset(state, encoded.reset_reason)
+        denoised = self._denoise_phase(encoded, state=state)
+        return self._postprocess_phase(encoded.postprocess_meta, denoised)
+
+    # -- Stage 0: encode ------------------------------------------------------
+
+    def encode_batch(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
+        """ENCODE stage: run the encoders and emit the encode -> denoise payload."""
+        encoded = self._encode_phase(batch)
+        if isinstance(encoded, DiffusionOutput):
+            return encoded
+
+        payload = self._pack_encode_payload(batch, encoded)
+        # Advance the issue-side window mirror only after the payload is built.
+        # The denoise stage remains the committed-progress authority; this mirror
+        # exists so the encode stage knows which observation branch to run next.
+        state = self._get_or_create_state(encoded.session_id)
+        state.current_start_frame = (
+            1 + self.num_frame_per_block
+            if encoded.window_start
+            else encoded.current_start_frame + self.num_frame_per_block
+        )
+        return DiffusionOutput(output=None, custom_output=payload.as_custom_output(), to_cpu=True)
+
+    def _encode_phase(self, req: DiffusionRequestBatch) -> _DreamZeroEncoded | DiffusionOutput:
+        """Tokenize, encode text/image/observation, and prepare latents + noise.
+
+        Returns a ``DiffusionOutput`` instead when the request is the engine's
+        observation-free warmup probe, which has nothing to encode.
+        """
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:
-            first_prompt = req.prompts[0] if req.prompts else ""
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            is_dummy_warmup = prompt == "dummy run" and req.sampling_params.num_inference_steps == 1
-            if is_dummy_warmup:
-                logger.info("Skipping DreamZero dummy warmup request without robot_obs.")
-                return DiffusionOutput(
-                    output={
-                        "actions": np.zeros(
-                            (self.action_horizon, self.max_action_dim),
-                            dtype=np.float32,
-                        ),
-                    },
-                )
+            dummy = self._dummy_warmup_output(req)
+            if dummy is not None:
+                return dummy
             raise KeyError("robot_obs")
+
         session_id = str(extra_args.get("session_id") or "default")
         state = self._get_or_create_state(session_id)
         self.state = state
-        transform, unified_obs = self._transform_robot_obs(robot_obs)
+        embodiment_key = str(robot_obs.get("embodiment", self.default_robot_embodiment))
+        _transform, unified_obs = self._transform_robot_obs(robot_obs)
         device = get_local_device()
 
         # ---- Step 1: Extract inputs from unified observation ----
@@ -1524,12 +1714,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         # Explicit request reset is handled by ARDiffusionModelRunner before it
         # binds this forward. Model-detected prompt/window resets still happen
-        # here because they depend on tokenized DreamZero state.
-        reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
+        # here because they depend on tokenized DreamZero state. Only the
+        # model-owned half of the reset runs in this phase: the KV half belongs
+        # to whichever stage owns the AR-Diffusion pool, and nothing between here
+        # and ``_apply_kv_reset`` touches KV.
+        reset_reason = state.reset_reason(text_tokens, 0, self.local_attn_size)
         if reset_reason == "session":
-            self._kv_reset(state)
+            state.reset(clear_video_latents=True)
         elif reset_reason == "inference":
-            self._kv_reset(state, clear_video_latents=False)
+            state.reset(clear_video_latents=False)
         state.language = text_tokens
 
         # Frame accumulation: stitched single frame -> multi-frame video
@@ -1539,20 +1732,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         videos = self._preprocess_video(videos)  # -> [B,C,T,H,W] bf16
         _, _, num_frames_raw, height, width = videos.shape
 
-        # Optional phase timing (DZ_PHASE_TIMING=1): logs per-forward stage costs
-        # (text encode / obs VAE encode / KV prefill / denoise) at INFO. Each mark
-        # synchronizes CUDA, so leave it off for timed benchmark runs.
-        _pt = None
-        if os.environ.get("DZ_PHASE_TIMING"):
-            import time as _time
-
-            torch.accelerator.synchronize()
-            _pt = {"time": _time, "t0": _time.perf_counter(), "marks": []}
-
-        def _pt_mark(name: str) -> None:
-            if _pt is not None:
-                torch.accelerator.synchronize()
-                _pt["marks"].append((name, _pt["time"].perf_counter()))
+        _pt, _pt_mark = self._phase_timing_probe()
 
         # Prompt embeds are constant within a session (a prompt change triggers a
         # "session" reset above, which clears this cache alongside state.language).
@@ -1585,7 +1765,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             image = videos[:, :, :1].transpose(1, 2)
 
-        if state.current_start_frame == 0:
+        window_start = state.current_start_frame == 0
+        if window_start:
             clip_feas, ys, image = self._encode_image(
                 image,
                 self.num_frames,
@@ -1595,16 +1776,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             state.clip_feas = clip_feas.to(dtype=image.dtype)
             state.ys = ys.to(dtype=image.dtype)
-
-            # Eager cross-attn population (AR-Diffusion only): cache text + image-token K/V
-            # into the pool now that the image is encoded (clip_feas available).
-            # Runs on the first forward of a session and after each window-boundary
-            # reset (current_start_frame returns to 0); the populate guards (text/img halves) gate re-entry.
-            self._kv_populate_cross(prompt_embeds, state.clip_feas, is_negative=False)
-            if negative_prompt_embeds is not None:
-                self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
-
-        if state.current_start_frame != 0:
+        else:
             latent_dtype = videos.dtype
             with torch.no_grad():
                 image = self._encode_observation_latents(state, videos, latent_dtype=latent_dtype)
@@ -1626,13 +1798,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         noise_action = torch.randn(
             batch_size,
             self.action_horizon,
-            self.transformer.action_dim,
+            self.action_dim,
             device=device,
             dtype=torch.bfloat16,
             generator=generator,
         )
 
-        _, num_channels, num_frames, h_latent, w_latent = noise_obs.shape
+        _, _num_channels, num_frames, h_latent, w_latent = noise_obs.shape
         frame_seqlen = int(h_latent * w_latent / 4)
         seq_len = frame_seqlen * num_frames
 
@@ -1640,13 +1812,87 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         noise_obs = noise_obs.transpose(1, 2)
 
         do_true_cfg = self.cfg_scale > 1.0 and negative_prompt_embeds is not None
+
+        return _DreamZeroEncoded(
+            session_id=session_id,
+            reset_reason=reset_reason,
+            window_start=window_start,
+            current_start_frame=int(state.current_start_frame),
+            frame_seqlen=frame_seqlen,
+            seq_len=seq_len,
+            do_true_cfg=do_true_cfg,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            clip_feas=state.clip_feas,
+            ys=state.ys,
+            image_latents=image,
+            noise_obs=noise_obs,
+            noise_action=noise_action,
+            state_features=state_features,
+            embodiment_id=embodiment_id,
+            postprocess_meta=_DreamZeroPostprocessMeta(
+                embodiment_name=str(embodiment_name),
+                embodiment_key=embodiment_key,
+                last_state=None if state_for_postprocess is None else state_for_postprocess[:, 0, :],
+            ),
+            phase_timing=_pt,
+        )
+
+    # -- Stage 1: denoise -----------------------------------------------------
+
+    def denoise_batch(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
+        """DENOISE stage: consume the encode payload, run the sharded DiT, emit latents.
+
+        Every TP rank enters the ordinary sharded DiT forward with the same
+        payload; the payload broadcast is the runner's, and the DiT's own
+        tensor-parallel collectives are untouched by disaggregation.
+        """
+        dummy = self._dummy_warmup_output(batch)
+        if dummy is not None:
+            # The engine's own observation-free probe carries no upstream payload.
+            return dummy
+        payload = self._unpack_stage_payload(batch, DREAMZERO_BOUNDARY_ENCODE_TO_DIT)
+        encoded, session_id = self._encoded_from_payload(payload)
+        state = self._get_or_create_state(session_id)
+        self.state = state
+        self._apply_kv_reset(state, encoded.reset_reason)
+        denoised = self._denoise_phase(encoded, state=state)
+        out_payload = self._pack_denoise_payload(payload, denoised)
+        return DiffusionOutput(output=None, custom_output=out_payload.as_custom_output(), to_cpu=True)
+
+    def _denoise_phase(
+        self,
+        enc: _DreamZeroEncoded,
+        *,
+        state: DreamZeroSessionState,
+    ) -> _DreamZeroDenoised:
+        """Populate cross-attn KV, prefill, and run the AR denoise loop."""
+        device = get_local_device()
+        _pt = enc.phase_timing
+        _pt_mark = self._phase_timing_marker(_pt)
+
+        # The denoise stage owns the conditioning the DiT reads off session state.
+        state.clip_feas = enc.clip_feas
+        state.ys = enc.ys
+
+        if enc.window_start:
+            # Eager cross-attn population (AR-Diffusion only): cache text +
+            # image-token K/V into the pool now that the image is encoded
+            # (clip_feas available). Runs on the first forward of a session and
+            # after each window-boundary reset; the populate guards (text/img
+            # halves) gate re-entry.
+            self._kv_populate_cross(enc.prompt_embeds, state.clip_feas, is_negative=False)
+            if enc.negative_prompt_embeds is not None:
+                self._kv_populate_cross(enc.negative_prompt_embeds, state.clip_feas, is_negative=True)
+
+        image = enc.image_latents
         self._prefill_kv_cache(
             image,
-            prompt_embeds,
-            negative_prompt_embeds,
-            frame_seqlen,
-            seq_len,
-            do_true_cfg,
+            enc.prompt_embeds,
+            enc.negative_prompt_embeds,
+            enc.frame_seqlen,
+            enc.seq_len,
+            enc.do_true_cfg,
             state,
         )
         _pt_mark("prefill_kv")
@@ -1678,57 +1924,74 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
         video_out, action_out = self.diffuse(
-            video_latents=noise_obs,
-            action_latents=noise_action,
+            video_latents=enc.noise_obs,
+            action_latents=enc.noise_action,
             timesteps_video=sample_scheduler.timesteps,
             timesteps_action=sample_scheduler_action.timesteps,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_embeds=enc.prompt_embeds,
+            negative_prompt_embeds=enc.negative_prompt_embeds,
             video_action_scheduler=video_action_scheduler,
-            do_true_cfg=do_true_cfg,
+            do_true_cfg=enc.do_true_cfg,
             state=state,
-            seq_len=seq_len,
-            state_features=state_features,
-            embodiment_id=embodiment_id,
+            seq_len=enc.seq_len,
+            state_features=enc.state_features,
+            embodiment_id=enc.embodiment_id,
         )
-        if _pt is not None:
-            _pt_mark("diffuse")
-            prev_t = _pt["t0"]
-            parts = []
-            for name, t in _pt["marks"]:
-                parts.append(f"{name}={1000 * (t - prev_t):.1f}ms")
-                prev_t = t
-            logger.info(
-                "DZ_PHASE_TIMING csf=%s total=%.1fms %s",
-                state.current_start_frame,
-                1000 * (prev_t - _pt["t0"]),
-                " ".join(parts),
-            )
+        self._log_phase_timing(_pt, _pt_mark, state)
 
         if state.current_start_frame == 1:
             video_out = torch.cat([image, video_out], dim=1)
+        # Committed progress: only advanced once the denoise loop has produced
+        # this chunk, and only on the stage that owns the KV it belongs to.
         state.current_start_frame += self.num_frame_per_block
 
         state.append_video_latents(video_out)
 
-        # q99 denorm: [-1,1] → real values
-        action_out = self._denormalize_action(action_out.float(), embodiment_name)
+        return _DreamZeroDenoised(video_latents=video_out, actions=action_out)
+
+    # -- Stage 2: decode / postprocess ---------------------------------------
+
+    def decode_batch(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
+        """DECODE stage: turn denoise output plus metadata into the response."""
+        dummy = self._dummy_warmup_output(batch)
+        if dummy is not None:
+            return dummy
+        payload = self._unpack_stage_payload(batch, DREAMZERO_BOUNDARY_DIT_TO_DECODE)
+        meta = _DreamZeroPostprocessMeta(
+            embodiment_name=str(payload.private_scalar_fields.get("embodiment_name", "")),
+            embodiment_key=str(payload.private_scalar_fields.get("embodiment_key") or self.default_robot_embodiment),
+            last_state=payload.private_tensor_fields.get("last_state"),
+        )
+        denoised = _DreamZeroDenoised(
+            video_latents=payload.tensor("video_latents"),
+            actions=payload.tensor("actions"),
+        )
+        return self._postprocess_phase(meta, denoised)
+
+    def _postprocess_phase(
+        self,
+        meta: _DreamZeroPostprocessMeta,
+        denoised: _DreamZeroDenoised,
+    ) -> DiffusionOutput:
+        """Denormalize actions, recover absolute joints, and build the output."""
+        # q99 denorm: [-1,1] -> real values
+        action_out = self._denormalize_action(denoised.actions.float(), meta.embodiment_name)
 
         # Relative -> absolute: only for relative_action_keys (joint_position only)
         # gripper_position is NOT relative, so don't add state back to it
-        if self.relative_action and state_for_postprocess is not None:
+        if self.relative_action and meta.last_state is not None:
             n_relative = self.relative_action_dim  # 7 for DROID (joint only)
             # Use original state precision for post-denorm absolute recovery.
             # Upstream adds obs state after `eval_transform.unapply()`
             # the bf16 denoising path.
-            last_state = state_for_postprocess[:, 0, :n_relative]  # (B, n_relative)
+            last_state = meta.last_state[:, :n_relative].to(device=action_out.device, dtype=action_out.dtype)
             action_out[..., :n_relative] = (
                 action_out[..., :n_relative] + last_state.unsqueeze(1)  # broadcast over horizon
             )
 
         # Squeeze batch dim for output: (B, horizon, dim) -> (horizon, dim)
         actions_np = action_out.squeeze(0).float().cpu().numpy()  # (horizon, max_action_dim)
-        actions_np = transform.transform_action_output(actions_np)
+        actions_np = get_transform(meta.embodiment_key).transform_action_output(actions_np)
 
         return DiffusionOutput(
             output={
@@ -1736,8 +1999,203 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 # Source `video_pred` is normalized VAE latent output, not RGB.
                 # Use `decode_video_latents()` for DreamZero-equivalent debug
                 # video decoding.
-                "video": video_out.transpose(1, 2).cpu(),
+                "video": denoised.video_latents.transpose(1, 2).cpu(),
             },
+        )
+
+    # -- Payload pack / unpack ------------------------------------------------
+
+    def _unpack_stage_payload(
+        self,
+        batch: DiffusionRequestBatch,
+        boundary: str,
+    ) -> DreamZeroStagePayload:
+        """Read, validate and localize the upstream payload for this stage."""
+        request = batch.requests[0]
+        payload = get_incoming_stage_payload(request.prompt)
+        payload.validate(request_id=str(request.request_id), boundary=boundary)
+        return payload.to_device(get_local_device())
+
+    def _pack_encode_payload(
+        self,
+        batch: DiffusionRequestBatch,
+        enc: _DreamZeroEncoded,
+    ) -> DreamZeroStagePayload:
+        """Build the encode -> denoise payload.
+
+        Prompt embeddings ride along on every tick rather than being cached on
+        the denoise side: they are a few MB next to a 14B DiT forward, and a
+        stateless edge means a restarted denoise worker cannot silently denoise
+        against a stale prompt.
+        """
+        tensor_fields: dict[str, torch.Tensor] = {
+            "prompt_embeds": enc.prompt_embeds,
+            "clip_feas": enc.clip_feas,
+            "ys": enc.ys,
+            "image_latents": enc.image_latents,
+            "noise_obs": enc.noise_obs,
+            "noise_action": enc.noise_action,
+            "embodiment_id": enc.embodiment_id,
+        }
+        if enc.negative_prompt_embeds is not None:
+            tensor_fields["negative_prompt_embeds"] = enc.negative_prompt_embeds
+        if enc.state_features is not None:
+            tensor_fields["state_features"] = enc.state_features
+
+        private_tensor_fields: dict[str, torch.Tensor] = {}
+        if enc.postprocess_meta.last_state is not None:
+            private_tensor_fields["last_state"] = enc.postprocess_meta.last_state
+
+        return DreamZeroStagePayload(
+            request_id=str(batch.requests[0].request_id),
+            boundary=DREAMZERO_BOUNDARY_ENCODE_TO_DIT,
+            scalar_fields={
+                "session_id": enc.session_id,
+                "reset_reason": enc.reset_reason,
+                "window_start": bool(enc.window_start),
+                "current_start_frame": int(enc.current_start_frame),
+                "frame_seqlen": int(enc.frame_seqlen),
+                "seq_len": int(enc.seq_len),
+                "do_true_cfg": bool(enc.do_true_cfg),
+            },
+            tensor_fields=tensor_fields,
+            # Postprocess metadata the denoise stage forwards without reading.
+            private_scalar_fields={
+                "embodiment_name": enc.postprocess_meta.embodiment_name,
+                "embodiment_key": enc.postprocess_meta.embodiment_key,
+            },
+            private_tensor_fields=private_tensor_fields,
+        )
+
+    def _encoded_from_payload(
+        self,
+        payload: DreamZeroStagePayload,
+    ) -> tuple[_DreamZeroEncoded, str]:
+        """Rebuild the in-process encode result from a validated wire payload."""
+        session_id = str(payload.scalar("session_id"))
+        encoded = _DreamZeroEncoded(
+            session_id=session_id,
+            reset_reason=payload.scalar("reset_reason", None),
+            window_start=bool(payload.scalar("window_start")),
+            current_start_frame=int(payload.scalar("current_start_frame")),
+            frame_seqlen=int(payload.scalar("frame_seqlen")),
+            seq_len=int(payload.scalar("seq_len")),
+            do_true_cfg=bool(payload.scalar("do_true_cfg")),
+            prompt_embeds=payload.tensor("prompt_embeds"),
+            negative_prompt_embeds=payload.tensor("negative_prompt_embeds", None),
+            clip_feas=payload.tensor("clip_feas"),
+            ys=payload.tensor("ys"),
+            image_latents=payload.tensor("image_latents"),
+            noise_obs=payload.tensor("noise_obs"),
+            noise_action=payload.tensor("noise_action"),
+            state_features=payload.tensor("state_features", None),
+            embodiment_id=payload.tensor("embodiment_id"),
+            postprocess_meta=_DreamZeroPostprocessMeta(embodiment_name="", embodiment_key=""),
+            phase_timing=None,
+        )
+        return encoded, session_id
+
+    def _pack_denoise_payload(
+        self,
+        incoming: DreamZeroStagePayload,
+        denoised: _DreamZeroDenoised,
+    ) -> DreamZeroStagePayload:
+        """Build the denoise -> decode payload, forwarding postprocess metadata."""
+        return DreamZeroStagePayload(
+            request_id=incoming.request_id,
+            boundary=DREAMZERO_BOUNDARY_DIT_TO_DECODE,
+            scalar_fields={
+                "session_id": incoming.scalar("session_id"),
+            },
+            tensor_fields={
+                "video_latents": denoised.video_latents,
+                "actions": denoised.actions,
+            },
+            # Opaque to this stage; the decode stage consumes them.
+            private_scalar_fields=dict(incoming.private_scalar_fields),
+            private_tensor_fields=dict(incoming.private_tensor_fields),
+        )
+
+    # -- Shared helpers -------------------------------------------------------
+
+    def _apply_kv_reset(self, state: DreamZeroSessionState, reset_reason: str | None) -> None:
+        """Apply the AR-Diffusion half of a reset on the stage that owns KV.
+
+        The model-owned half already ran in ``_encode_phase`` (it needs the
+        tokenized prompt to decide). A stage without a bound AR-Diffusion pool
+        still resets its own session state so its window position stays in step.
+        """
+        if reset_reason is None:
+            return
+        clear_video_latents = reset_reason == "session"
+        if self._ar_diffusion_kv_state is None:
+            state.reset(clear_video_latents=clear_video_latents)
+            return
+        self._kv_reset(state, clear_video_latents=clear_video_latents)
+
+    def _dummy_warmup_output(self, req: DiffusionRequestBatch) -> DiffusionOutput | None:
+        """Zero-action output for the engine's observation-free warmup probe."""
+        first_prompt = req.prompts[0] if req.prompts else ""
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        if not (prompt == "dummy run" and req.sampling_params.num_inference_steps == 1):
+            return None
+        logger.info("Skipping DreamZero dummy warmup request without robot_obs.")
+        return DiffusionOutput(
+            output={
+                "actions": np.zeros(
+                    (self.action_horizon, self.max_action_dim),
+                    dtype=np.float32,
+                ),
+            },
+        )
+
+    @staticmethod
+    def _phase_timing_probe():
+        """Start optional per-phase timing (DZ_PHASE_TIMING=1).
+
+        Each mark synchronizes the accelerator, so leave it off for timed
+        benchmark runs.
+        """
+        if not os.environ.get("DZ_PHASE_TIMING"):
+            return None, lambda name: None
+
+        import time as _time
+
+        torch.accelerator.synchronize()
+        probe = {"time": _time, "t0": _time.perf_counter(), "marks": []}
+
+        def mark(name: str) -> None:
+            torch.accelerator.synchronize()
+            probe["marks"].append((name, probe["time"].perf_counter()))
+
+        return probe, mark
+
+    @staticmethod
+    def _phase_timing_marker(probe):
+        if probe is None:
+            return lambda name: None
+
+        def mark(name: str) -> None:
+            torch.accelerator.synchronize()
+            probe["marks"].append((name, probe["time"].perf_counter()))
+
+        return mark
+
+    @staticmethod
+    def _log_phase_timing(probe, mark, state: DreamZeroSessionState) -> None:
+        if probe is None:
+            return
+        mark("diffuse")
+        prev_t = probe["t0"]
+        parts = []
+        for name, t in probe["marks"]:
+            parts.append(f"{name}={1000 * (t - prev_t):.1f}ms")
+            prev_t = t
+        logger.info(
+            "DZ_PHASE_TIMING csf=%s total=%.1fms %s",
+            state.current_start_frame,
+            1000 * (prev_t - probe["t0"]),
+            " ".join(parts),
         )
 
     # -----------------------------------------------------------------------

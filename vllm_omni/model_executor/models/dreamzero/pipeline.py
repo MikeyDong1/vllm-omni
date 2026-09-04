@@ -24,8 +24,8 @@ transport choice. Both edges declare the same single payload key; the payload's
 
 Runtime knobs (device placement, Stage-1 tensor parallelism, AR-Diffusion
 backend, connector wiring) live in ``vllm_omni/deploy/dreamzero_disaggregated.yaml``;
-select it with ``--deploy-config``. Switching the transport (shared memory today,
-NIXL later) is a deploy-config edit and touches no DreamZero source.
+select it with ``--deploy-config``. Switching to a different transport is a
+deploy-config edit and touches no DreamZero source.
 """
 
 from vllm_omni.config.stage_config import (

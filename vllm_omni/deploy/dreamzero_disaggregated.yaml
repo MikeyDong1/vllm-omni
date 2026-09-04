@@ -6,28 +6,28 @@
 #
 # Topology (stage roles and payload keys) is declared in
 # vllm_omni/model_executor/models/dreamzero/pipeline.py. This file owns only
-# runtime placement and transport.
+# runtime placement.
 #
-# The transport is named here and nowhere else: DreamZero's model code declares
-# the payload keys and never a connector. Moving this deployment to a different
-# transport is a change to the two `connectors:` entries below (name, plus any
-# backend-specific `extra`) and nothing else -- no DreamZero source, no stage
-# dispatch, no payload schema, and no change to the XPU tensor-parallel
-# collectives Stage 1 uses.
+# Stage payload transfer: this default configures **no** stage-payload connector,
+# so the DreamZero payload stays on `DiffusionOutput.custom_output` and travels
+# the existing inline IPC/orchestrator path. The pipeline still declares its
+# directional payload keys -- that declaration is a payload *capability*, not a
+# transport choice -- and the worker-side connector hooks stay inert while no
+# connector edge exists.
 #
-# Both edges carry the same payload key (`dreamzero_stage_payload`); the payload's
-# own `boundary` field distinguishes encode->denoise from denoise->decode.
+# Adding a fast path later is a deploy-only change: declare a connector and wire
+# the `to_stage_N` / `from_stage_N` edges for stages 0->1 and 1->2. No DreamZero
+# source, payload schema, `run_stage` dispatch or XPU tensor-parallel collective
+# changes with it.
+#
+# AR-Diffusion KV needs no connector configuration at all: the paged KV pool is
+# engine-local to Stage 1 and never crosses a stage boundary, so there is nothing
+# here to keep separate from a stage-payload connector.
 
 pipeline: dreamzero_disaggregated
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
-
-connectors:
-  encode_payload:
-    name: SharedMemoryConnector
-  denoise_payload:
-    name: SharedMemoryConnector
 
 stages:
   # ---- Stage 0: Encode ----------------------------------------------------
@@ -46,8 +46,6 @@ stages:
         needs_stereo_camera: false
         needs_session_id: true
         action_space: joint_position
-    output_connectors:
-      to_stage_1: encode_payload
 
   # ---- Stage 1: Denoise ---------------------------------------------------
   # The four logical devices form one vLLM tensor-parallel group, so the sharded
@@ -55,9 +53,10 @@ stages:
   # back to oneCCL) exactly as it does in the monolithic deployment. XPU device
   # visibility is still remapped by ZE_AFFINITY_MASK.
   #
-  # Disaggregation does not touch that path: the connector only delivers the
-  # stage payload to the transfer-leader rank, which broadcasts it over the same
-  # TP group; every rank then runs its own shard of the DiT forward.
+  # Stage payload transfer never touches that path: with no connector edge the
+  # payload arrives inline, and with one it is delivered to the transfer-leader
+  # rank and broadcast over this same TP group. Either way every rank then runs
+  # its own shard of the DiT forward.
   - stage_id: 1
     devices: "0,1,2,3"
     max_num_seqs: 1
@@ -83,10 +82,6 @@ stages:
       step_cache_dit_enabled: true
       velocity_sim_thresholds: [0.95, 0.93]
       velocity_skip_countdowns: [4, 2]
-    input_connectors:
-      from_stage_0: encode_payload
-    output_connectors:
-      to_stage_2: denoise_payload
 
   # ---- Stage 2: Decode ----------------------------------------------------
   # Action postprocess only. DreamZero's response carries normalized video
@@ -105,5 +100,3 @@ stages:
         needs_stereo_camera: false
         needs_session_id: true
         action_space: joint_position
-    input_connectors:
-      from_stage_1: denoise_payload

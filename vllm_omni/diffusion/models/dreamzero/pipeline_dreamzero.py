@@ -67,7 +67,6 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -659,24 +658,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Wan ``feat_cache`` mutation is incompatible with CUDAGraph capture.
         DiT blocks use per-block ``fullgraph=True``.
         """
-        # Gate on the platform rather than on torch.cuda: DreamZero runs compiled on
-        # every accelerator whose platform declares inductor support, and hard-coding
-        # CUDA silently left XPU (and ROCm, and MUSA) in eager for no reason.
-        #
-        # Order matters. UnspecifiedOmniPlatform -- what resolves when no accelerator
-        # is detected -- reports 0 devices but does not implement
-        # supports_torch_inductor(), so the device-count check has to short-circuit
-        # first or a CPU-only run raises NotImplementedError instead of skipping.
-        if current_omni_platform.get_device_count() == 0:
-            logger.info("DreamZero setup_compile skipped: no accelerator detected.")
-            return
-        if not current_omni_platform.supports_torch_inductor():
-            logger.info(
-                "DreamZero setup_compile skipped: %s does not support the inductor backend.",
-                type(current_omni_platform).__name__,
-            )
-            return
-
         from vllm_omni.diffusion.models.dreamzero.wan_vae_feat_cache_patch import (
             apply_wan_vae_feat_cache_tensor_patch,
         )

@@ -76,7 +76,7 @@ def _stage_payload_handle_key() -> str:
         from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
         return str(DiffusionModelRunner._STAGE_PAYLOAD_HANDLE_KEY)
-    except Exception:  # pragma: no cover - orchestrator without the worker deps
+    except (ImportError, AttributeError):  # pragma: no cover - orchestrator without worker deps
         # The suffix rule below still forwards the handle; this only affects the
         # exact-match fast path.
         return "_stage_payload_transfer"

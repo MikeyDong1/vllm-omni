@@ -70,7 +70,7 @@ class DreamZeroStaleRequestError(ValueError):
     """
 
 
-def _reject_opaque(where: str, name: str, value: Any) -> None:
+def _reject_opaque(where: str, name: str, value: object) -> None:
     if isinstance(value, (torch.nn.Module, torch.device, torch.Generator, FunctionType, MethodType)):
         raise DreamZeroPayloadError(
             f"{where}[{name!r}] is a {type(value).__name__}; DreamZero stage payloads "
@@ -80,7 +80,7 @@ def _reject_opaque(where: str, name: str, value: Any) -> None:
         raise DreamZeroPayloadError(f"{where}[{name!r}] is callable; DreamZero stage payloads carry only data.")
 
 
-def _validate_scalar(where: str, name: str, value: Any) -> None:
+def _validate_scalar(where: str, name: str, value: object) -> None:
     _reject_opaque(where, name, value)
     if isinstance(value, _ALLOWED_SCALARS):
         return
@@ -100,7 +100,7 @@ def _validate_scalar(where: str, name: str, value: Any) -> None:
     )
 
 
-def _validate_tensor(where: str, name: str, value: Any) -> None:
+def _validate_tensor(where: str, name: str, value: object) -> None:
     _reject_opaque(where, name, value)
     if not isinstance(value, torch.Tensor):
         raise DreamZeroPayloadError(
@@ -143,7 +143,7 @@ class DreamZeroStagePayload:
         }
 
     @classmethod
-    def from_dict(cls, raw: Any) -> DreamZeroStagePayload:
+    def from_dict(cls, raw: object) -> DreamZeroStagePayload:
         """Rebuild a typed payload from a wire dict, validating as we go."""
         if raw is None:
             raise DreamZeroPayloadError("DreamZero stage payload is missing.")
@@ -225,7 +225,7 @@ class DreamZeroStagePayload:
             raise DreamZeroPayloadError(f"DreamZero {self.boundary!r} payload is missing scalar field {name!r}.")
         return default
 
-    def tensor(self, name: str, default: Any = _MISSING) -> Any:
+    def tensor(self, name: str, default: Any = _MISSING) -> torch.Tensor | None:
         if name in self.tensor_fields:
             return self.tensor_fields[name]
         if default is _MISSING:
@@ -247,7 +247,7 @@ class DreamZeroStagePayload:
         return {DREAMZERO_STAGE_PAYLOAD_KEY: self.to_dict()}
 
 
-def get_incoming_stage_payload(prompt: Any) -> DreamZeroStagePayload:
+def get_incoming_stage_payload(prompt: object) -> DreamZeroStagePayload:
     """Read the upstream payload out of a consuming stage's prompt.
 
     The connector receive path writes into ``prompt["additional_information"]``;

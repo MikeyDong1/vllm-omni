@@ -176,6 +176,30 @@ class SessionStateManager:
             session.reset()
             return True
 
+    def raise_max_sessions(self, max_sessions: int) -> bool:
+        """Raise the LRU bound, never lower it. Returns whether it changed.
+
+        An owner that only learns how many sessions will really be live *after*
+        construction -- an engine publishing its own memory-derived capacity, say
+        -- has to be able to lift the bound, or this table evicts sessions that
+        owner still considers live.
+
+        Lowering is refused rather than honoured: already-resident sessions would
+        become evictable mid-life, and the overflow path in
+        ``get_or_create_session`` drops the table entry *without* resetting
+        buffers, so the next lookup silently returns a fresh ``SessionState`` and
+        the accumulated history is gone with no error. Shrinking a live bound is
+        never what a caller wants; call ``drop_session`` to release a session
+        deliberately.
+        """
+        if max_sessions <= 0:
+            raise ValueError(f"max_sessions must be positive, got {max_sessions}")
+        with self._lock:
+            if max_sessions <= self.max_sessions:
+                return False
+            self.max_sessions = max_sessions
+            return True
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._sessions)

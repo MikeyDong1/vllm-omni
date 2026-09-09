@@ -236,12 +236,59 @@ def _bespoke_pipe(max_states: int) -> DreamZeroPipeline:
     return pipe
 
 
+def _manager_backed_pipe(max_sessions: int) -> tuple[DreamZeroPipeline, SessionStateManager]:
+    """A pipeline on the opt-in manager path, policed the way ``__init__`` does it."""
+    manager = SessionStateManager(max_sessions=max_sessions, evict_when_full=False)
+    pipe = DreamZeroPipeline.__new__(DreamZeroPipeline)
+    pipe._states = OrderedDict()
+    pipe._memory_manager = manager
+    pipe._max_session_states = max_sessions
+    pipe.num_frame_per_block = 2
+    pipe.state = None
+    return pipe, manager
+
+
 def _seeded_state(marker: int) -> DreamZeroState:
-    """A state carrying a device-side tensor and a call history that must survive."""
+    """A state carrying a call history that must survive."""
     state = DreamZeroState()
     state.vae_encoder_out = torch.zeros(marker + 1, dtype=torch.float32)
     state.call_count = marker + 1
     return state
+
+
+def _mid_rollout_state() -> DreamZeroState:
+    """A state mid-rollout: VAE stream live, causal cache non-empty, prompt cached.
+
+    ``vae_enc_feat_map`` is the field with no recompute source and the bulk of the
+    ~603 MiB, so it is the one that actually has to survive capacity pressure --
+    asserting on ``len(_states)`` or object identity alone would not catch its
+    loss.
+    """
+    state = DreamZeroState()
+    state.vae_stream_initialized = True
+    state.vae_enc_feat_map = [torch.ones(2, 3, dtype=torch.float32)]
+    state.vae_encoder_out = torch.ones(1, 1, 4, dtype=torch.float32)
+    state.vae_pending_body_frames = torch.ones(3, dtype=torch.float32)
+    state.prompt_embeds = torch.ones(2, dtype=torch.float32)
+    state.language = torch.ones(2, dtype=torch.long)
+    state.call_count = 7
+    state.current_start_frame = 12
+    return state
+
+
+def _assert_mid_rollout_intact(state: DreamZeroState) -> None:
+    """Every field ``reset()`` would have cleared is still exactly as seeded."""
+    assert state.vae_stream_initialized is True
+    assert state.vae_enc_feat_map is not None
+    assert len(state.vae_enc_feat_map) == 1
+    assert torch.equal(state.vae_enc_feat_map[0], torch.ones(2, 3, dtype=torch.float32))
+    assert state.vae_encoder_out is not None
+    assert torch.equal(state.vae_encoder_out, torch.ones(1, 1, 4, dtype=torch.float32))
+    assert state.vae_pending_body_frames is not None
+    assert state.prompt_embeds is not None
+    assert state.language is not None
+    assert state.call_count == 7
+    assert state.current_start_frame == 12
 
 
 def test_new_session_at_the_bound_is_refused() -> None:
@@ -306,6 +353,103 @@ def test_non_positive_bound_means_unbounded() -> None:
     assert len(pipe._states) == 3
 
 
+def test_refusal_leaves_a_mid_rollout_session_completely_untouched() -> None:
+    """The unrecoverable fields, not just the dict entry.
+
+    ``vae_enc_feat_map`` has no recompute source, so this is the assertion that
+    actually distinguishes "refused the newcomer" from "quietly reset a live
+    session".
+    """
+    pipe = _bespoke_pipe(1)
+    live = _mid_rollout_state()
+    pipe._states["s0"] = live
+    pipe.state = live
+
+    with pytest.raises(SessionAdmissionError):
+        DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    _assert_mid_rollout_intact(pipe._states["s0"])
+    # ...and it is still continuable, which is the point.
+    assert DreamZeroPipeline._require_session_state(pipe, "s0") is live
+
+
+def test_slots_are_reclaimed_across_many_begin_close_cycles() -> None:
+    """CPU stand-in for the long serial soak: admission must not leak slots.
+
+    Holds the table at its bound and then cycles one session out and one in, many
+    times over. A slot that is not truly reclaimed on close shows up as a refusal
+    part-way through instead of at the end.
+    """
+    pipe = _bespoke_pipe(4)
+    for index in range(4):
+        DreamZeroPipeline._get_or_create_state(pipe, f"resident{index}")
+
+    for cycle in range(100):
+        DreamZeroPipeline.close_ar_diffusion_session(pipe, f"resident{cycle % 4}")
+        DreamZeroPipeline._get_or_create_state(pipe, f"resident{cycle % 4}")
+        assert len(pipe._states) == 4
+
+    for index in range(4):
+        DreamZeroPipeline.close_ar_diffusion_session(pipe, f"resident{index}")
+    assert not pipe._states
+
+
+# -- the same rules on the manager path --------------------------------------
+#
+# The two stores refuse through different mechanisms: the bespoke path via
+# ``_admit_session_state()``, the manager path from inside the adapter's
+# constructor, which calls ``get_or_create_session()``. Both are reachable from
+# ``_get_or_create_state()``, so both need covering or a deployment's actual path
+# may be the untested one.
+
+
+def test_manager_path_refuses_a_new_session_at_the_bound() -> None:
+    pipe, manager = _manager_backed_pipe(2)
+    DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    with pytest.raises(SessionAdmissionError):
+        DreamZeroPipeline._get_or_create_state(pipe, "s2")
+
+    assert len(manager) == 2
+    assert manager.evictions == 0
+    assert "s2" not in manager
+
+
+def test_manager_path_refusal_preserves_resident_sessions() -> None:
+    pipe, manager = _manager_backed_pipe(1)
+    resident = DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    resident.call_count = 5
+
+    with pytest.raises(SessionAdmissionError):
+        DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    assert "s0" in manager
+    # A fresh adapter is built per call, so read the session back through one.
+    assert DreamZeroPipeline._require_session_state(pipe, "s0").call_count == 5
+
+
+def test_manager_path_still_serves_a_resident_session_when_full() -> None:
+    pipe, manager = _manager_backed_pipe(2)
+    DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    assert DreamZeroPipeline._get_or_create_state(pipe, "s0") is not None
+    assert len(manager) == 2
+
+
+def test_manager_path_admits_again_after_close() -> None:
+    pipe, manager = _manager_backed_pipe(1)
+    DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    with pytest.raises(SessionAdmissionError):
+        DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    DreamZeroPipeline.close_ar_diffusion_session(pipe, "s0")
+
+    assert DreamZeroPipeline._get_or_create_state(pipe, "s1") is not None
+    assert len(manager) == 1
+
+
 # -- continuation must find its history ---------------------------------------
 
 
@@ -359,6 +503,57 @@ def test_manager_path_continuation_does_not_create_via_the_adapter() -> None:
 
     assert "never-began" not in manager
     assert len(manager) == 0
+
+
+@pytest.mark.parametrize("hook", ["close_ar_diffusion_session", "reset_ar_diffusion_session"])
+def test_continuation_after_release_fails_instead_of_restarting(hook: str) -> None:
+    """The sequence the whole change exists to forbid.
+
+    A released session must not be silently re-served on empty state: that is the
+    path that returns normal-looking but wrong output, since ``reset_reason()``
+    reports ``"session"`` for a fresh state and the rollout quietly restarts.
+    """
+    pipe = _bespoke_pipe(4)
+    live = _mid_rollout_state()
+    pipe._states["s0"] = live
+    pipe.state = live
+
+    getattr(DreamZeroPipeline, hook)(pipe, "s0")
+
+    with pytest.raises(SessionStateLostError):
+        DreamZeroPipeline._require_session_state(pipe, "s0")
+    assert not pipe._states
+    # A fresh begin is the documented way back, and it starts genuinely clean.
+    reborn = DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    assert reborn is not live
+    assert reborn.call_count == 0
+    assert reborn.vae_enc_feat_map is None
+
+
+def test_manager_path_continuation_after_release_fails() -> None:
+    pipe, manager = _manager_backed_pipe(4)
+    DreamZeroPipeline._get_or_create_state(pipe, "s0")
+
+    DreamZeroPipeline.close_ar_diffusion_session(pipe, "s0")
+
+    assert "s0" not in manager
+    with pytest.raises(SessionStateLostError):
+        DreamZeroPipeline._require_session_state(pipe, "s0")
+
+
+@pytest.mark.parametrize("hook", ["close_ar_diffusion_session", "reset_ar_diffusion_session"])
+def test_release_is_idempotent_and_unknown_release_is_a_no_op(hook: str) -> None:
+    """Repeat and stray releases must not double-release or resurrect a session."""
+    pipe = _bespoke_pipe(4)
+    pipe._states["s0"] = _mid_rollout_state()
+    survivor = DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    getattr(DreamZeroPipeline, hook)(pipe, "s0")
+    getattr(DreamZeroPipeline, hook)(pipe, "s0")
+    getattr(DreamZeroPipeline, hook)(pipe, "never-existed")
+
+    assert list(pipe._states) == ["s1"]
+    assert pipe._states["s1"] is survivor
 
 
 def test_manager_path_continuation_binds_an_existing_session() -> None:
@@ -433,6 +628,38 @@ def test_export_helpers_refuse_an_unknown_session(method: str) -> None:
         getattr(DreamZeroPipeline, method)(pipe, "never-began")
 
     assert not pipe._states
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["decode_accumulated_video_latents", "clear_accumulated_video_latents"],
+)
+def test_export_must_run_before_the_session_is_released(method: str) -> None:
+    """Pins the ordering this creates: export consumes the accumulated history, so
+    it has to happen while the session is still resident. No in-tree caller closes
+    a DreamZero session before exporting, but a future one that did would now get a
+    clear error rather than an empty decode."""
+    pipe = _bespoke_pipe(4)
+    DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    DreamZeroPipeline.close_ar_diffusion_session(pipe, "s0")
+
+    with pytest.raises(SessionStateLostError):
+        getattr(DreamZeroPipeline, method)(pipe, "s0")
+
+
+def test_clear_accumulated_latents_keeps_the_session_continuable() -> None:
+    """Clearing exported latents is not an end-of-session signal: the VAE stream
+    and frame history a continuation needs must survive it."""
+    pipe = _bespoke_pipe(4)
+    live = _mid_rollout_state()
+    live.video_latents_across_time = [torch.ones(1, 1, 2, 2, 2, dtype=torch.float32)]
+    pipe._states["s0"] = live
+
+    DreamZeroPipeline.clear_accumulated_video_latents(pipe, "s0")
+
+    assert live.video_latents_across_time == []
+    _assert_mid_rollout_intact(live)
+    assert DreamZeroPipeline._require_session_state(pipe, "s0") is live
 
 
 # -- capacity published by the runner ----------------------------------------

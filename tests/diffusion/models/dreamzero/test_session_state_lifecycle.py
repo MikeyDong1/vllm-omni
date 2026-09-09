@@ -18,7 +18,6 @@ from collections import OrderedDict
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.dreamzero import pipeline_dreamzero as pipeline_module
 from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
     DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
     MAX_DREAMZERO_SESSIONS,
@@ -26,11 +25,17 @@ from vllm_omni.diffusion.models.dreamzero.pipeline_dreamzero import (
     DreamZeroPipeline,
 )
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
+from vllm_omni.experimental.ar_diffusion.tick_protocol import (
+    AR_DIFFUSION_TICK_KEY,
+    ARDiffusionTickRequest,
+)
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import (
     DreamZeroStateAdapter,
 )
 from vllm_omni.experimental.world_models.session_state import (
     LatentBuffer,
+    SessionAdmissionError,
+    SessionStateLostError,
     SessionStateManager,
 )
 
@@ -104,6 +109,57 @@ def test_raise_max_sessions_rejects_non_positive(capacity: int) -> None:
     assert manager.max_sessions == 2
 
 
+# -- SessionStateManager admission policy ------------------------------------
+
+
+def test_manager_evicts_when_full_by_default() -> None:
+    """Unchanged for every other model on this store (e.g. cosmos3): only an
+    opt-in makes admission fail instead."""
+    manager = SessionStateManager(max_sessions=2)
+
+    for index in range(3):
+        manager.get_or_create_session(f"s{index}")
+
+    assert len(manager) == 2
+    assert manager.evictions == 1
+    assert "s0" not in manager
+
+
+def test_manager_refuses_new_session_when_not_evicting() -> None:
+    manager = SessionStateManager(max_sessions=2, evict_when_full=False)
+    manager.get_or_create_session("s0")
+    manager.get_or_create_session("s1")
+
+    with pytest.raises(SessionAdmissionError, match="cannot admit session 's2'"):
+        manager.get_or_create_session("s2")
+
+    assert len(manager) == 2
+    assert manager.evictions == 0
+    # Both resident sessions survive the refusal.
+    assert "s0" in manager
+    assert "s1" in manager
+
+
+def test_manager_still_serves_resident_sessions_when_full() -> None:
+    manager = SessionStateManager(max_sessions=2, evict_when_full=False)
+    first = manager.get_or_create_session("s0")
+    manager.get_or_create_session("s1")
+
+    assert manager.get_or_create_session("s0") is first
+
+
+def test_manager_admits_again_after_drop_session() -> None:
+    manager = SessionStateManager(max_sessions=1, evict_when_full=False)
+    manager.get_or_create_session("s0")
+    with pytest.raises(SessionAdmissionError):
+        manager.get_or_create_session("s1")
+
+    assert manager.drop_session("s0") is True
+
+    assert manager.get_or_create_session("s1") is not None
+    assert len(manager) == 1
+
+
 # -- pipeline hook routing ---------------------------------------------------
 
 
@@ -156,15 +212,18 @@ def test_bespoke_hook_pops_states_and_clears_alias() -> None:
     assert pipe.state is None
 
 
-# -- bounded ``_states`` ------------------------------------------------------
+# -- admission, not eviction --------------------------------------------------
 #
 # The hooks above are the *only* removal path for ``_states``, and they are
 # reached solely from the AR-Diffusion runner's release path. A stage that holds
 # session state without hosting the engine -- the disaggregated encode stage,
 # where ``engine_backend: ARDiffusionEngine`` is set on denoise only -- never
-# receives that signal, so every finished session used to stay resident at
-# ~603 MiB each. These cover the backstop bound that makes the pipeline
-# memory-safe on its own.
+# receives that signal, so finished sessions accumulate at ~603 MiB each.
+#
+# The bound therefore refuses *new* sessions rather than evicting resident ones.
+# Per-session state includes the Wan VAE causal-convolution cache, which has no
+# recompute source, so evicting a session that is later continued would silently
+# restart its rollout and return normal-looking but wrong output.
 
 
 def _bespoke_pipe(max_states: int) -> DreamZeroPipeline:
@@ -173,104 +232,72 @@ def _bespoke_pipe(max_states: int) -> DreamZeroPipeline:
     pipe._states = OrderedDict()
     pipe._memory_manager = None
     pipe._max_session_states = max_states
-    pipe._session_state_evict_warned = False
     pipe.state = None
     return pipe
 
 
 def _seeded_state(marker: int) -> DreamZeroState:
-    """A state carrying a device-side tensor and a call history to lose."""
+    """A state carrying a device-side tensor and a call history that must survive."""
     state = DreamZeroState()
     state.vae_encoder_out = torch.zeros(marker + 1, dtype=torch.float32)
     state.call_count = marker + 1
     return state
 
 
-def test_insert_over_bound_evicts_oldest_and_keeps_newest() -> None:
+def test_new_session_at_the_bound_is_refused() -> None:
     pipe = _bespoke_pipe(2)
+    DreamZeroPipeline._get_or_create_state(pipe, "s0")
+    DreamZeroPipeline._get_or_create_state(pipe, "s1")
 
+    with pytest.raises(SessionAdmissionError, match="cannot admit DreamZero session 's2'"):
+        DreamZeroPipeline._get_or_create_state(pipe, "s2")
+
+    assert list(pipe._states) == ["s0", "s1"]
+
+
+def test_refusing_a_new_session_preserves_resident_history() -> None:
+    """The regression this whole change exists for: an arriving session must not
+    cost an existing one its unrecoverable VAE history."""
+    pipe = _bespoke_pipe(1)
+    resident = _seeded_state(3)
+    pipe._states["s0"] = resident
+    pipe.state = resident
+
+    with pytest.raises(SessionAdmissionError):
+        DreamZeroPipeline._get_or_create_state(pipe, "s1")
+
+    assert pipe._states["s0"] is resident
+    assert resident.vae_encoder_out is not None
+    assert resident.call_count == 4
+    assert pipe.state is resident
+
+
+def test_resident_session_is_still_served_at_the_bound() -> None:
+    """The bound gates admission, not lookup: a full table must keep serving the
+    sessions it already admitted, or capacity pressure would stall everyone."""
+    pipe = _bespoke_pipe(2)
     first = DreamZeroPipeline._get_or_create_state(pipe, "s0")
-    second = DreamZeroPipeline._get_or_create_state(pipe, "s1")
-    third = DreamZeroPipeline._get_or_create_state(pipe, "s2")
+    DreamZeroPipeline._get_or_create_state(pipe, "s1")
 
-    assert list(pipe._states) == ["s1", "s2"]
-    assert pipe._states["s1"] is second
-    assert pipe._states["s2"] is third
-    # The evicted session is gone, so it comes back as a distinct object.
-    assert DreamZeroPipeline._get_or_create_state(pipe, "s0") is not first
+    assert DreamZeroPipeline._get_or_create_state(pipe, "s0") is first
+    assert DreamZeroPipeline._require_session_state(pipe, "s0") is first
+    # Reuse still reorders, so ordering stays meaningful for observability.
+    assert list(pipe._states) == ["s1", "s0"]
 
 
-def test_reuse_reorders_so_the_active_session_is_never_the_victim() -> None:
-    """``move_to_end`` on a hit is what makes the bound an LRU and not a FIFO."""
-    pipe = _bespoke_pipe(2)
+def test_admission_recovers_after_a_session_is_released() -> None:
+    pipe = _bespoke_pipe(1)
     DreamZeroPipeline._get_or_create_state(pipe, "s0")
-    DreamZeroPipeline._get_or_create_state(pipe, "s1")
+    with pytest.raises(SessionAdmissionError):
+        DreamZeroPipeline._get_or_create_state(pipe, "s1")
 
-    # Touch the oldest so the *other* entry becomes the eviction candidate.
-    DreamZeroPipeline._get_or_create_state(pipe, "s0")
-    DreamZeroPipeline._get_or_create_state(pipe, "s2")
+    DreamZeroPipeline.close_ar_diffusion_session(pipe, "s0")
 
-    assert list(pipe._states) == ["s0", "s2"]
-
-
-def test_eviction_releases_the_evicted_state_buffers() -> None:
-    """Popping the entry is not enough: GC is too late to free device memory."""
-    pipe = _bespoke_pipe(1)
-    doomed = _seeded_state(0)
-    pipe._states["s0"] = doomed
-
-    DreamZeroPipeline._get_or_create_state(pipe, "s1")
-
-    assert "s0" not in pipe._states
-    # We still hold a reference, so this proves ``reset()`` ran rather than the
-    # object merely becoming unreachable.
-    assert doomed.vae_encoder_out is None
-    assert doomed.call_count == 0
+    assert DreamZeroPipeline._get_or_create_state(pipe, "s1") is not None
+    assert list(pipe._states) == ["s1"]
 
 
-def test_eviction_clears_the_alias_when_it_viewed_the_evicted_state() -> None:
-    pipe = _bespoke_pipe(1)
-    doomed = _seeded_state(0)
-    pipe._states["s0"] = doomed
-    pipe.state = doomed
-
-    DreamZeroPipeline._get_or_create_state(pipe, "s1")
-
-    assert pipe.state is None
-
-
-def test_eviction_keeps_an_alias_pointing_at_a_survivor() -> None:
-    pipe = _bespoke_pipe(2)
-    pipe._states["s0"] = _seeded_state(0)
-    survivor = DreamZeroPipeline._get_or_create_state(pipe, "s1")
-    pipe.state = survivor
-
-    DreamZeroPipeline._get_or_create_state(pipe, "s2")
-
-    assert "s0" not in pipe._states
-    assert pipe.state is survivor
-
-
-def test_eviction_warns_once_naming_the_missing_close(monkeypatch) -> None:
-    """Hitting the bound means a close was lost; say so, but only once."""
-    messages: list[str] = []
-
-    def _capture(msg, *args, **kwargs):
-        messages.append(msg % args if args else msg)
-
-    monkeypatch.setattr(pipeline_module.logger, "warning", _capture)
-
-    pipe = _bespoke_pipe(1)
-    for index in range(4):
-        DreamZeroPipeline._get_or_create_state(pipe, f"s{index}")
-
-    evict_warnings = [m for m in messages if "close_ar_diffusion_session()" in m]
-    assert len(evict_warnings) == 1
-    assert pipe._session_state_evict_warned is True
-    assert len(pipe._states) == 1
-
-
-def test_non_positive_bound_means_unbounded_not_evict_everything() -> None:
+def test_non_positive_bound_means_unbounded() -> None:
     pipe = _bespoke_pipe(0)
 
     for index in range(3):
@@ -279,12 +306,141 @@ def test_non_positive_bound_means_unbounded_not_evict_everything() -> None:
     assert len(pipe._states) == 3
 
 
+# -- continuation must find its history ---------------------------------------
+
+
+def test_continuation_of_an_unknown_session_fails_loudly() -> None:
+    """A continuation must never be served fresh state: ``reset_reason()`` reports
+    ``"session"`` for empty state, so the pipeline would quietly restart the
+    rollout while the denoise stage's KV for that session is still live."""
+    pipe = _bespoke_pipe(4)
+
+    with pytest.raises(SessionStateLostError, match="has no resident state"):
+        DreamZeroPipeline._require_session_state(pipe, "never-began")
+
+    # The failed lookup must not have created anything.
+    assert not pipe._states
+
+
+def test_continuation_error_says_how_to_recover() -> None:
+    pipe = _bespoke_pipe(4)
+
+    with pytest.raises(SessionStateLostError, match=r'extra_args\["reset"\]=True'):
+        DreamZeroPipeline._require_session_state(pipe, "gone")
+
+
+def test_continuation_returns_the_same_state_object() -> None:
+    pipe = _bespoke_pipe(4)
+    begun = DreamZeroPipeline._get_or_create_state(pipe, "s0")
+
+    assert DreamZeroPipeline._require_session_state(pipe, "s0") is begun
+
+
+def test_continuation_of_default_session_works() -> None:
+    """``__init__`` seeds ``"default"``, so a request that sends no session_id and
+    no reset still resolves."""
+    pipe = _bespoke_pipe(4)
+    default = DreamZeroPipeline._get_or_create_state(pipe, "default")
+
+    assert DreamZeroPipeline._require_session_state(pipe, None) is default
+
+
+def test_manager_path_continuation_does_not_create_via_the_adapter() -> None:
+    """The adapter's constructor calls ``get_or_create_session()``, so membership
+    has to be checked before it is built or the absent session is created by the
+    very lookup meant to report it missing."""
+    manager = SessionStateManager(max_sessions=4, evict_when_full=False)
+    pipe = _bespoke_pipe(4)
+    pipe._memory_manager = manager
+    pipe.num_frame_per_block = 2
+
+    with pytest.raises(SessionStateLostError):
+        DreamZeroPipeline._require_session_state(pipe, "never-began")
+
+    assert "never-began" not in manager
+    assert len(manager) == 0
+
+
+def test_manager_path_continuation_binds_an_existing_session() -> None:
+    manager = SessionStateManager(max_sessions=4, evict_when_full=False)
+    manager.get_or_create_session("s0")
+    pipe = _bespoke_pipe(4)
+    pipe._memory_manager = manager
+    pipe.num_frame_per_block = 2
+
+    adapter = DreamZeroPipeline._require_session_state(pipe, "s0")
+
+    assert isinstance(adapter, DreamZeroStateAdapter)
+    assert adapter.session_id == "s0"
+
+
+# -- begin-vs-continue is read the way the runner reads it --------------------
+
+
+def test_flat_reset_marks_a_begin() -> None:
+    assert DreamZeroPipeline._request_begins_session({"reset": True}) is True
+    assert DreamZeroPipeline._request_begins_session({"reset": False}) is False
+    assert DreamZeroPipeline._request_begins_session({}) is False
+
+
+def test_tick_reset_marks_a_begin_without_a_flat_key() -> None:
+    """A typed tick namespaces its fields and does not duplicate them at the top
+    level, and its extra_args are merged onto a *static* per-deployment template,
+    so the flat key cannot express per-request begin/continue on that path. The
+    runner releases the old session on the tick's value, so reading anything else
+    here would demand state the runner just dropped."""
+    tick = ARDiffusionTickRequest(session_id="s0", request_id="r0", chunk_index=0, reset=True)
+
+    assert DreamZeroPipeline._request_begins_session(tick.to_extra_args()) is True
+
+
+def test_tick_continuation_is_not_a_begin() -> None:
+    tick = ARDiffusionTickRequest(session_id="s0", request_id="r1", chunk_index=1, reset=False)
+
+    assert DreamZeroPipeline._request_begins_session(tick.to_extra_args()) is False
+
+
+def test_flat_reset_still_counts_alongside_a_tick() -> None:
+    """The consumer merges the tick over a template that may carry flat keys;
+    either source asserting a begin is enough, so a begin is never misread as a
+    continuation."""
+    tick = ARDiffusionTickRequest(session_id="s0", request_id="r0", chunk_index=0, reset=False)
+    merged = {"reset": True, **tick.to_extra_args()}
+
+    assert DreamZeroPipeline._request_begins_session(merged) is True
+
+
+def test_malformed_tick_falls_back_to_the_flat_key() -> None:
+    """The forward must not gain a new parse failure: a non-mapping tick is
+    ignored here and left for the runner's own validation to reject."""
+    assert DreamZeroPipeline._request_begins_session({AR_DIFFUSION_TICK_KEY: "nonsense"}) is False
+    assert DreamZeroPipeline._request_begins_session({AR_DIFFUSION_TICK_KEY: "nonsense", "reset": True}) is True
+
+
+# -- export consumes history, never creates it --------------------------------
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["decode_accumulated_video_latents", "clear_accumulated_video_latents"],
+)
+def test_export_helpers_refuse_an_unknown_session(method: str) -> None:
+    """These run from the video export worker at the end of a rollout; creating a
+    session there would mask a lost session rather than report it."""
+    pipe = _bespoke_pipe(4)
+
+    with pytest.raises(SessionStateLostError):
+        getattr(DreamZeroPipeline, method)(pipe, "never-began")
+
+    assert not pipe._states
+
+
 # -- capacity published by the runner ----------------------------------------
 
 
-def test_published_capacity_raises_the_floor_and_suppresses_eviction() -> None:
-    """A runner already reserves 603 MiB/session and evicts at its own bound,
-    signalling us each time, so we must not drop state it still holds live."""
+def test_published_capacity_raises_the_floor_and_admits_more() -> None:
+    """A runner already reserves 603 MiB/session and will keep that many live, so
+    refusing a session it has room for would be our bound, not its budget."""
     pipe = _bespoke_pipe(2)
 
     DreamZeroPipeline.set_resident_session_state_capacity(pipe, 5)
@@ -297,10 +453,9 @@ def test_published_capacity_raises_the_floor_and_suppresses_eviction() -> None:
 
 def test_published_capacity_reaches_the_manager_too() -> None:
     """Regression: the manager is built in ``__init__`` with the configured cap,
-    so raising only ``_max_session_states`` would leave it evicting at the lower
-    bound -- and its overflow drops the entry without resetting buffers, so the
-    next request would silently get a fresh session and lose its history."""
-    manager = SessionStateManager(max_sessions=2)
+    so raising only ``_max_session_states`` would leave the manager refusing at the
+    lower bound while the bespoke path admitted."""
+    manager = SessionStateManager(max_sessions=2, evict_when_full=False)
     pipe = _bespoke_pipe(2)
     pipe._memory_manager = manager
 
@@ -317,7 +472,7 @@ def test_published_capacity_reaches_the_manager_too() -> None:
 
 def test_published_capacity_never_lowers_the_bound() -> None:
     pipe = _bespoke_pipe(4)
-    manager = SessionStateManager(max_sessions=4)
+    manager = SessionStateManager(max_sessions=4, evict_when_full=False)
     pipe._memory_manager = manager
 
     DreamZeroPipeline.set_resident_session_state_capacity(pipe, 1)
@@ -351,18 +506,26 @@ def test_resident_state_bound_is_not_the_kv_slot_count() -> None:
     assert resident_bytes < 8 * 1024**3
 
 
-def test_manager_honours_the_same_small_bound() -> None:
-    """The two stores must be sized together.
+def test_manager_honours_the_same_small_bound_and_policy() -> None:
+    """The two stores must be sized *and policed* together.
 
     ``_drop_ar_diffusion_session_state()`` returns early on the manager path
-    without touching ``_states``, so a bound enforced on only one of them is
-    dead code for whichever path a deployment actually takes.
+    without touching ``_states``, so a bound enforced on only one of them is dead
+    code for whichever path a deployment actually takes -- and a bound that
+    refuses on one path while evicting on the other still loses history.
     """
-    manager = SessionStateManager(max_sessions=MAX_RESIDENT_DREAMZERO_SESSION_STATES)
+    manager = SessionStateManager(
+        max_sessions=MAX_RESIDENT_DREAMZERO_SESSION_STATES,
+        evict_when_full=False,
+    )
 
-    for index in range(MAX_RESIDENT_DREAMZERO_SESSION_STATES + 2):
+    for index in range(MAX_RESIDENT_DREAMZERO_SESSION_STATES):
         manager.get_or_create_session(f"s{index}")
 
+    with pytest.raises(SessionAdmissionError):
+        manager.get_or_create_session("one-too-many")
+
     assert len(manager) == MAX_RESIDENT_DREAMZERO_SESSION_STATES
-    assert manager.evictions == 2
-    assert "s0" not in manager
+    assert manager.evictions == 0
+    # Every admitted session is still there; none paid for the refused one.
+    assert all(f"s{index}" in manager for index in range(MAX_RESIDENT_DREAMZERO_SESSION_STATES))

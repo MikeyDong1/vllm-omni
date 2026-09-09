@@ -15,7 +15,7 @@ import math
 import os
 import re as re_module
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 
 import numpy as np
@@ -61,8 +61,11 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.tick_protocol import AR_DIFFUSION_TICK_KEY
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
 from vllm_omni.experimental.world_models.session_state import (
+    SessionAdmissionError,
+    SessionStateLostError,
     SessionStateManager,
     resolve_session_state_config,
 )
@@ -74,20 +77,28 @@ MAX_DREAMZERO_SESSIONS = 64
 # entries. This is the measured persistent CUDA upper bound per live session.
 DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 
-# How many per-session states the pipeline keeps resident. Deliberately far
+# How many per-session states the pipeline admits at once. Deliberately far
 # below ``MAX_DREAMZERO_SESSIONS``: that is a count of *KV* slots, which the KV
 # manager then shrinks to fit its own budget, whereas this bounds *model-owned*
 # state at DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION each. At 603 MiB per
 # session, 64 resident states would be 38.6 GiB -- more than a whole device --
 # so reusing the KV count here would be a bound that can never fire before OOM.
 #
-# This is a backstop, not the primary lifecycle. Sessions are normally released
-# by the AR-Diffusion runner's explicit close/reset; a deployment that holds
-# session state on a stage with no runner (the disaggregated encode stage, where
-# ``engine_backend: ARDiffusionEngine`` is set on denoise only) never receives
-# that signal, and without a bound every finished session stays resident. Raise
-# it with OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS if a deployment
-# genuinely interleaves more live sessions than this.
+# This is an *admission* limit, not an eviction threshold. Per-session state
+# includes the Wan VAE causal-convolution cache, which has no recompute source:
+# rebuilding it would mean re-encoding the whole observation history, which is
+# not retained. So a full table refuses the *new* session rather than dropping an
+# existing one -- continuing a session on freshly created state would silently
+# restart its rollout and return normal-looking but wrong output.
+#
+# Sessions are normally released by the AR-Diffusion runner's explicit
+# close/reset. A deployment that holds session state on a stage with no runner
+# (the disaggregated encode stage, where ``engine_backend: ARDiffusionEngine`` is
+# set on denoise only) never receives that signal, so finished sessions are never
+# released and admission eventually fails. That is the missing signal surfacing,
+# not this bound misbehaving. Raise it with
+# OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS if a deployment genuinely
+# interleaves more live sessions than this.
 MAX_RESIDENT_DREAMZERO_SESSION_STATES = 4
 
 # The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
@@ -485,18 +496,19 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         # Opt-in: back per-session state with the shared SessionStateManager
         # (RFC #4480). Default off -> the bespoke DreamZeroState path above.
-        # One resolved cap drives *both* stores: the manager keeps its own LRU,
-        # and ``_states`` is bounded by ``_evict_stale_session_states()``. Sizing
-        # them separately is how a bound ends up enforced on only one of the two
-        # paths a deployment can take.
+        # One resolved cap drives *both* stores, and both refuse rather than
+        # evict: ``_states`` via ``_admit_session_state()`` and the manager via
+        # ``evict_when_full=False``. Sizing or policing them separately is how a
+        # bound ends up enforced on only one of the two paths a deployment takes.
         self._use_memory_manager, mm_max_sessions = resolve_session_state_config(
             enable=od_config.enable_session_state_manager,
             max_sessions=MAX_RESIDENT_DREAMZERO_SESSION_STATES,
         )
         self._max_session_states = mm_max_sessions
-        self._session_state_evict_warned = False
         self._memory_manager: SessionStateManager | None = (
-            SessionStateManager(max_sessions=mm_max_sessions) if self._use_memory_manager else None
+            SessionStateManager(max_sessions=mm_max_sessions, evict_when_full=False)
+            if self._use_memory_manager
+            else None
         )
         if self._use_memory_manager:
             logger.info("DreamZero: session state manager enabled (max_sessions=%d)", mm_max_sessions)
@@ -582,33 +594,115 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         session_key = str(session_id or "default")
         state = self._states.get(session_key)
         if state is None:
+            # Only an insert can exceed the bound; a hit just reorders.
+            self._admit_session_state(session_key)
             state = DreamZeroState()
             self._states[session_key] = state
-            # Only an insert can push the table over its bound; a hit just
-            # reorders it.
-            self._evict_stale_session_states()
         else:
             self._states.move_to_end(session_key)
         return state
 
+    def _require_session_state(self, session_id: str | None) -> DreamZeroSessionState:
+        """Return an already-admitted session's state, or fail.
+
+        The continuation counterpart to ``_get_or_create_state()``. A request that
+        continues a session must find the state that session built up; creating a
+        fresh one instead would silently restart the rollout, because
+        ``reset_reason()`` reports ``"session"`` for empty state and the pipeline
+        would quietly re-initialise. The Wan VAE causal-convolution cache has no
+        recompute source, so the history cannot be reconstructed -- and on a
+        disaggregated deployment the denoise stage's KV for this session is still
+        live, so the two stages would silently disagree. Fail instead.
+        """
+        session_key = str(session_id or "default")
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            # Check membership before building the adapter: the adapter's
+            # constructor calls get_or_create_session(), which would create the
+            # very state whose absence we are trying to report.
+            if session_key not in manager:
+                raise SessionStateLostError(self._session_state_lost_message(session_key))
+            return DreamZeroStateAdapter(
+                session_id,
+                manager,
+                vae_encoder_window=self.num_frame_per_block,
+            )
+        state = self._states.get(session_key)
+        if state is None:
+            raise SessionStateLostError(self._session_state_lost_message(session_key))
+        self._states.move_to_end(session_key)
+        return state
+
+    @staticmethod
+    def _request_begins_session(extra_args: Mapping[str, object]) -> bool:
+        """Whether this request begins a session, read the way the runner reads it.
+
+        A typed tick namespaces its fields under ``AR_DIFFUSION_TICK_KEY`` and
+        does *not* duplicate them at the top level, while the tick's own
+        ``extra_args`` is merged onto a static per-deployment template
+        (``ARDiffusionConsumer._sampling_params_for_tick``). So the flat key alone
+        cannot express per-request begin/continue on the tick path. The runner
+        releases the old session on the tick's value
+        (``ARDiffusionModelRunner.execute_model``), so reading a different source
+        here would leave the forward demanding state the runner just dropped.
+        Either source saying "begin" counts.
+        """
+        tick = extra_args.get(AR_DIFFUSION_TICK_KEY)
+        if isinstance(tick, Mapping) and bool(tick.get("reset", False)):
+            return True
+        return bool(extra_args.get("reset", False))
+
+    @staticmethod
+    def _session_state_lost_message(session_key: str) -> str:
+        return (
+            f"DreamZero session {session_key!r} has no resident state, so this request cannot "
+            "continue it. Its per-session history (including the VAE causal-convolution cache) "
+            "cannot be rebuilt, so the request is refused rather than silently restarted on empty "
+            'state. Begin a new session by sending a request with extra_args["reset"]=True.'
+        )
+
+    def _admit_session_state(self, session_key: str) -> None:
+        """Refuse a new session once the resident bound is reached.
+
+        Admission rather than eviction: every resident state holds history that
+        cannot be rebuilt, so the new session is refused instead of being paid for
+        by stranding an existing one. Sessions are normally released by the
+        AR-Diffusion runner's explicit close/reset, so reaching this bound means
+        either more sessions are genuinely live at once than the cap allows, or a
+        stage is holding finished sessions because that signal never arrived.
+        """
+        # getattr guards lightweight test fixtures that build the pipeline via
+        # __new__ and seed only ``_states``.
+        max_states = getattr(self, "_max_session_states", MAX_RESIDENT_DREAMZERO_SESSION_STATES)
+        if max_states <= 0 or len(self._states) < max_states:
+            # Non-positive means "no bound".
+            return
+        raise SessionAdmissionError(
+            f"cannot admit DreamZero session {session_key!r}: {len(self._states)} of {max_states} "
+            f"resident session states are in use (~{DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION // (1024 * 1024)} "
+            "MiB each). Existing sessions hold history that cannot be rebuilt, so they are kept and "
+            "this one is refused. Either more sessions are live at once than the cap allows, or "
+            "finished sessions were never released because close_ar_diffusion_session() never "
+            "arrived -- which happens when the pipeline holds session state on a stage that does "
+            "not host the AR-Diffusion engine. Raise the cap with "
+            "OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS if the concurrency is real."
+        )
+
     def set_resident_session_state_capacity(self, capacity: int) -> None:
-        """Raise the resident-state floor to a runner's own session capacity.
+        """Raise the admission bound to a runner's own session capacity.
 
         The AR-Diffusion runner derives a memory-safe session capacity that
         already reserves ``model_owned_state_bytes_per_session`` per session, and
-        evicts its own sessions at that bound -- signalling us each time. Lifting
-        our floor to match means we can never drop state for a session the runner
-        still considers live: it releases first, and we only ever evict what it
-        has already let go. Where there is no runner to signal (a disaggregated
-        stage that holds session state without hosting the engine) the configured
-        cap governs, which is exactly where the bound has to do the work.
+        will keep that many live. Lifting our bound to match keeps us from
+        refusing a session the engine has room for. Where there is no runner to
+        publish a capacity (a disaggregated stage that holds session state without
+        hosting the engine) the configured cap governs, which is exactly where the
+        bound has to do the work.
 
-        Both stores are raised together. The manager was constructed in
+        Both stores are raised together. The manager is constructed in
         ``__init__`` with the configured cap, so lifting only
-        ``_max_session_states`` would leave the manager path evicting at the lower
-        bound -- and its overflow drops the table entry *without* resetting
-        buffers, so an evicted session's next request would silently get a fresh
-        ``SessionState`` and lose its accumulated history.
+        ``_max_session_states`` would leave the manager path refusing at the lower
+        bound while the bespoke path admitted.
         """
         capacity = int(capacity)
         if capacity <= 0:
@@ -625,51 +719,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             current,
             capacity,
         )
-
-    def _evict_stale_session_states(self) -> None:
-        """Bound ``_states`` by count, releasing each evicted session's buffers.
-
-        ``_states`` maintains LRU ordering via ``move_to_end`` but has no
-        eviction of its own: its only removal path is
-        ``_drop_ar_diffusion_session_state()``, reachable solely from the
-        AR-Diffusion runner's release path. Anything that holds session state
-        without a co-located runner therefore never sees an end-of-life signal,
-        and each finished session keeps its device tensors for the life of the
-        process. This is the backstop for that case.
-
-        Evicted states are reset rather than merely unreferenced, mirroring
-        ``SessionStateManager.drop_session()``: dropping the last reference leaves
-        the buffers for whenever GC next runs, which on an accelerator is too late
-        to be useful.
-        """
-        # getattr guards lightweight test fixtures that build the pipeline via
-        # __new__ and seed only ``_states``.
-        max_states = getattr(self, "_max_session_states", MAX_RESIDENT_DREAMZERO_SESSION_STATES)
-        if max_states <= 0:
-            # Non-positive means "no bound" rather than "evict everything".
-            return
-        while len(self._states) > max_states:
-            evicted_key, evicted = self._states.popitem(last=False)
-            try:
-                evicted.reset()
-            except Exception:  # noqa: BLE001 - eviction must free the table even if one state resists
-                logger.exception("DreamZero: failed to release evicted session state %s", evicted_key)
-            if getattr(self, "state", None) is evicted:
-                self.state = None
-            # Reaching the bound means a session was never closed: warn once,
-            # naming the cause, so the missing signal stays visible instead of
-            # being silently absorbed here.
-            if not getattr(self, "_session_state_evict_warned", False):
-                logger.warning(
-                    "DreamZero: evicted session state %s at the %d-session bound "
-                    "(~%d MiB each); a session ended without close_ar_diffusion_session(), "
-                    "so this stage is holding finished sessions. Expected when the pipeline "
-                    "holds session state on a stage that does not host the AR-Diffusion engine.",
-                    evicted_key,
-                    max_states,
-                    DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION // (1024 * 1024),
-                )
-                self._session_state_evict_warned = True
 
     # -----------------------------------------------------------------------
     # Root config loading
@@ -1168,7 +1217,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def decode_accumulated_video_latents(self, session_id: str | None = None) -> torch.Tensor:
         """Decode all AR-chunk latents accumulated for ``session_id``."""
-        state = self._get_or_create_state(session_id)
+        # Export consumes an existing session's history; it must never be the
+        # thing that creates the session.
+        state = self._require_session_state(session_id)
         latents = state.get_concatenated_video_latents()
         if latents is None:
             session_key = str(session_id or "default")
@@ -1177,7 +1228,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def clear_accumulated_video_latents(self, session_id: str | None = None) -> None:
         """Clear accumulated video latents for ``session_id`` without resetting KV state."""
-        state = self._get_or_create_state(session_id)
+        state = self._require_session_state(session_id)
         state.clear_video_latents()
 
     # -----------------------------------------------------------------------
@@ -1484,7 +1535,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 )
             raise KeyError("robot_obs")
         session_id = str(extra_args.get("session_id") or "default")
-        state = self._get_or_create_state(session_id)
+        # ``reset`` is the protocol's begin-vs-continue signal (see the AR runner,
+        # which releases the old session on it). Only a begin may create state: a
+        # continuation must find the history its session built up, or fail loudly
+        # rather than restart the rollout on empty state.
+        if self._request_begins_session(extra_args):
+            state = self._get_or_create_state(session_id)
+        else:
+            state = self._require_session_state(session_id)
         self.state = state
         transform, unified_obs = self._transform_robot_obs(robot_obs)
         device = get_local_device()

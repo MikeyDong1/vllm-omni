@@ -36,6 +36,27 @@ DEFAULT_MAX_SESSIONS = 64
 M = TypeVar("M", bound=StateObject)
 
 
+class SessionAdmissionError(RuntimeError):
+    """No room to admit a new session.
+
+    Raised instead of evicting when a store is configured to reject on full.
+    Retryable: a caller can wait for a live session to end and try again. Derives
+    from ``RuntimeError`` so existing broad handlers keep working.
+    """
+
+
+class SessionStateLostError(RuntimeError):
+    """A continuation arrived for a session whose state is no longer resident.
+
+    Distinct from ``SessionAdmissionError``: the session was admitted once, and
+    the history a continuation needs is gone. Raised rather than silently
+    returning a fresh session, because per-session state such as a VAE
+    causal-convolution cache has no recompute source -- continuing on empty state
+    produces normal-looking but wrong output. The caller must start a new session
+    explicitly.
+    """
+
+
 class SessionState:
     """The named ``StateObject`` collection for one session."""
 
@@ -110,10 +131,18 @@ class SessionStateManager:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         byte_budget: int | None = None,
         lock_factory: Callable[[], AbstractContextManager[object]] = threading.Lock,
+        evict_when_full: bool = True,
     ) -> None:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         self.max_sessions = max_sessions
+        # What to do when a new session arrives at ``max_sessions``. The default
+        # keeps the count-based LRU below. ``False`` makes admission fail instead,
+        # for a model whose per-session state cannot be rebuilt: there, dropping
+        # the oldest entry silently strands history a later continuation needs, so
+        # refusing the *new* session is the safe answer. Opt-in so models already
+        # relying on eviction are unaffected.
+        self.evict_when_full = evict_when_full
         # Recorded for observability; enforcement is left to an eviction
         # planner (see RFC #4480). Not scoped to a device: which pool a budget
         # applies to is a question for whoever enforces it, so read
@@ -141,10 +170,20 @@ class SessionStateManager:
         with self._lock:
             session = self._sessions.get(key)
             if session is None:
+                if not self.evict_when_full and len(self._sessions) >= self.max_sessions:
+                    # Admission, not eviction: the resident sessions keep history
+                    # that cannot be rebuilt, so the new one is refused rather
+                    # than paid for by stranding an existing session's state.
+                    raise SessionAdmissionError(
+                        f"cannot admit session {key!r}: {len(self._sessions)} of {self.max_sessions} "
+                        "session slots are in use and this store is configured not to evict. "
+                        "Either more sessions are live at once than the cap allows, or finished "
+                        "sessions were never released -- end a session explicitly, or raise the cap."
+                    )
                 self.misses += 1
                 session = SessionState()
                 self._sessions[key] = session
-                while len(self._sessions) > self.max_sessions:
+                while self.evict_when_full and len(self._sessions) > self.max_sessions:
                     # Drop the oldest from the table only; do not free its
                     # buffers. An adapter still using the session keeps its own
                     # reference, so its state survives (matching a model's own

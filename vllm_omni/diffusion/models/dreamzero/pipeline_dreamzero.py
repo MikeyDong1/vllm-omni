@@ -519,6 +519,25 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             None if img_ctx is None else tuple(img_ctx.shape),
         )
 
+    def _reset_kv_session(self, *, keep_text_cross_attention: bool) -> None:
+        """Reset only the bound engine KV pool; the model's session state is untouched.
+
+        ``keep_text_cross_attention=True`` marks a window ("inference") reset: the
+        prompt is unchanged, so the pool keeps the text cross-attn K/V and only the
+        image half repopulates on the restart forward.
+
+        ``keep_text_cross_attention=False`` is a full session release -- the pool
+        closes and drops every named cross-attention allocation -- so the caller
+        must be on a window-start forward, the only one that repopulates them.
+        """
+        kv_state = self._ar_diffusion_kv_state
+        if kv_state is None:
+            raise RuntimeError(
+                "DreamZero KV reset requires a bound AR-Diffusion session; "
+                "the stage must run on the AR-Diffusion engine."
+            )
+        kv_state.reset(keep_cross_attention=("text",) if keep_text_cross_attention else ())
+
     def _kv_reset(self, state, *, clear_video_latents: bool = True):
         """Reset the engine's pooled session window plus the model's non-KV state.
 
@@ -526,13 +545,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         same window so the next forward starts fresh. ``clear_video_latents=False``
         keeps the accumulated video latents for export.
 
-        ``clear_video_latents=False`` also marks a window ("inference") reset: the
-        prompt is unchanged, so the pool keeps the text cross-attn K/V and only the
-        image half repopulates on the restart forward.
+        For the stage that owns both halves of a reset for its own session state
+        (the consuming denoise role). The full role resets model state in
+        ``_encode_phase`` and calls ``_reset_kv_session`` directly, so it must not
+        come through here -- that would erase the encode it just produced.
+
+        The KV half runs first so an unbound pool raises before anything is
+        mutated, rather than leaving the model state half-reset.
         """
+        self._reset_kv_session(keep_text_cross_attention=not clear_video_latents)
         state.reset(clear_video_latents=clear_video_latents)
-        keep_cross = ("text",) if not clear_video_latents else ()
-        self._ar_diffusion_kv_state.reset(keep_cross_attention=keep_cross)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
@@ -1663,12 +1685,31 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             # Dummy warmup request with no observation: nothing to denoise.
             return encoded
 
+        # A full KV release drops every cross-attention allocation, and only a
+        # window-start forward repopulates it (see ``_denoise_phase``). Both reset
+        # reasons zero ``current_start_frame`` before ``window_start`` is derived
+        # from it, so the two always agree; fail loudly if they ever stop agreeing,
+        # and do it before ``_authorize_stage_progress`` advances any progress.
+        if encoded.reset_reason == "session" and not encoded.window_start:
+            raise RuntimeError(
+                f"DreamZero session {encoded.session_id!r} opens a new session at window frame "
+                f"{encoded.current_start_frame} without a window start; a full KV release needs "
+                "the forward that repopulates cross-attention."
+            )
+
         state = self._get_or_create_state(encoded.session_id)
         authorization = self._authorize_stage_progress(encoded, state)
-        if authorization.new_epoch:
-            self._fence_session_epoch(state)
-        else:
-            self._apply_kv_reset(state, encoded.reset_reason)
+        # The model-owned half of the reset already ran in ``_encode_phase`` -- that
+        # decision needs the tokenized prompt -- and this encode then rebuilt the
+        # state, so only the KV half is left to apply. Resetting the state again
+        # here would drop the language, prompt-embed cache, VAE stream and frame
+        # buffer that were just produced, which makes the next request look like a
+        # brand new session. ``authorization.new_epoch`` already implies a
+        # ``"session"`` reason in this role, since both progress counters belong to
+        # this process and move together; the disjunction keeps the two honest.
+        new_session = authorization.new_epoch or encoded.reset_reason == "session"
+        if new_session or encoded.reset_reason == "inference":
+            self._reset_kv_session(keep_text_cross_attention=not new_session)
         denoised = self._denoise_phase(encoded, state=state)
         self._commit_stage_progress(encoded)
         return self._postprocess_phase(encoded.postprocess_meta, denoised)
@@ -1764,14 +1805,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         text_tokens = text_inputs["input_ids"].to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
 
-        # Explicit request reset is handled by ARDiffusionModelRunner before it
-        # binds this forward. Model-detected prompt/window resets still happen
-        # here because they depend on tokenized DreamZero state. Only the
-        # model-owned half of the reset runs in this phase: the KV half belongs
-        # to whichever stage owns the AR-Diffusion pool, and nothing between here
-        # and ``_apply_kv_reset`` touches KV.
-        reset_reason = state.reset_reason(text_tokens, 0, self.local_attn_size)
+        # An explicit request reset clears this stage's own model state. The plain
+        # encode stage has no AR runner to do that for it, and the full role must
+        # not depend on the runner having released the session first. Model-detected
+        # prompt/window resets are decided here too, because they depend on the
+        # tokenized DreamZero state. Only the model-owned half of the reset runs in
+        # this phase: the KV half belongs to whichever stage owns the AR-Diffusion
+        # pool, and nothing between here and that reset touches KV.
+        reset_reason = "session" if explicit_reset else state.reset_reason(text_tokens, 0, self.local_attn_size)
         if reset_reason == "session":
+            if explicit_reset:
+                # ``reset_reason()`` logs its own verdicts; this branch skips it.
+                logger.info("explicit request reset for session=%s, resetting", session_id)
             state.reset(clear_video_latents=True)
         elif reset_reason == "inference":
             state.reset(clear_video_latents=False)
@@ -1783,7 +1828,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # reset continues the same session and keeps the epoch.
         epoch, sequence, attempt = self._next_issue_progress(
             session_id,
-            new_epoch=explicit_reset or reset_reason == "session",
+            new_epoch=reset_reason == "session",
         )
 
         # Frame accumulation: stitched single frame -> multi-frame video
@@ -2299,29 +2344,25 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _fence_session_epoch(self, state: DreamZeroSessionState) -> None:
         """Drop the previous epoch's window before the first chunk of a new one.
 
-        The AR runner already releases the session when a request carries
+        Consuming-stage helper: it resets this stage's own session state as well as
+        its KV. The AR runner already releases the session when a request carries
         ``reset``, but the epoch stamp makes this stage self-sufficient: it
         fences the old window even if it never saw that flag.
         """
-        if self._ar_diffusion_kv_state is None:
-            state.reset(clear_video_latents=True)
-            return
         self._kv_reset(state, clear_video_latents=True)
 
     def _apply_kv_reset(self, state: DreamZeroSessionState, reset_reason: str | None) -> None:
-        """Apply the AR-Diffusion half of a reset on the stage that owns KV.
+        """Apply a reset on the consuming stage that owns both halves for itself.
 
-        The model-owned half already ran in ``_encode_phase`` (it needs the
-        tokenized prompt to decide). A stage without a bound AR-Diffusion pool
-        still resets its own session state so its window position stays in step.
+        In a split deployment this stage's session state is a different object in a
+        different process from the encode stage's, so it resets its own copy here;
+        the encode stage did its own in ``_encode_phase``. The full role does not
+        come through here -- ``_encode_phase`` ran in the same process, so it resets
+        KV only.
         """
         if reset_reason is None:
             return
-        clear_video_latents = reset_reason == "session"
-        if self._ar_diffusion_kv_state is None:
-            state.reset(clear_video_latents=clear_video_latents)
-            return
-        self._kv_reset(state, clear_video_latents=clear_video_latents)
+        self._kv_reset(state, clear_video_latents=reset_reason == "session")
 
     def _dummy_warmup_output(self, req: DiffusionRequestBatch) -> DiffusionOutput | None:
         """Zero-action output for the engine's observation-free warmup probe."""

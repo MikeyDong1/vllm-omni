@@ -195,6 +195,12 @@ def test_xpu_page_size_refusal_falls_back_and_is_remembered(monkeypatch):
 
     The refusal is recorded, so later calls skip the failed dispatch entirely rather
     than paying it once per layer per step.
+
+    ``_reference_paged_attention`` is mocked here because this test is about
+    *dispatch*, not reference numerics: the fake-device query carries a stand-in
+    ``device`` object that ``torch.arange(..., device=...)`` inside the real
+    reference cannot accept. Reference numerics are covered on genuine CPU
+    tensors by ``test_paged_attention_matches_dense_reference_cpu``.
     """
     q, kc, vc, bt, qsl, sl = _make_paged_inputs()
     monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
@@ -210,15 +216,18 @@ def test_xpu_page_size_refusal_falls_back_and_is_remembered(monkeypatch):
         patch("torch.version.hip", None),
         patch(_FA_FUNC, side_effect=refusing_fa, create=True),
         patch(_FA_AVAILABLE, return_value=True),
+        patch.object(pa, "_reference_paged_attention", return_value=torch.zeros_like(q)) as ref_mock,
     ):
         first = _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
         assert pa.ar_diffusion_paged_attention_backend == "reference"
         assert first.shape == q.shape
         assert page_size in pa._XPU_REJECTED_PAGE_SIZES
+        assert ref_mock.call_count == 1
 
         second = _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
 
     assert calls["kernel"] == 1, "the refused page size should not be retried per call"
+    assert ref_mock.call_count == 2, "the second call must still be served by the reference"
     assert second.shape == q.shape
     assert pa.ar_diffusion_paged_attention_backend == "reference"
 

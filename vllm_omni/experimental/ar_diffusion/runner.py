@@ -150,10 +150,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             device=self.device,
         )
         self._session_capacity = self.kv_cache.session_capacity
-        # Tell the pipeline how many sessions we will keep resident, so a pipeline
-        # that bounds its own per-session state does not evict one we still hold
-        # live. Optional by design: only pipelines that keep such a store
-        # implement it, so this stays off SupportsARDiffusionPipeline.
+        # Publish capacity to pipelines that bound model-owned state. The hook is
+        # optional because not every AR pipeline owns such a store.
         publish_capacity = getattr(capability, "set_resident_session_state_capacity", None)
         if callable(publish_capacity):
             publish_capacity(self._session_capacity)

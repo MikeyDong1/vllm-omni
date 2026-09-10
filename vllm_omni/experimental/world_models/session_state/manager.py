@@ -37,24 +37,11 @@ M = TypeVar("M", bound=StateObject)
 
 
 class SessionAdmissionError(RuntimeError):
-    """No room to admit a new session.
-
-    Raised instead of evicting when a store is configured to reject on full.
-    Retryable: a caller can wait for a live session to end and try again. Derives
-    from ``RuntimeError`` so existing broad handlers keep working.
-    """
+    """Admission refused at capacity; retry after a session is released."""
 
 
 class SessionStateLostError(RuntimeError):
-    """A continuation arrived for a session whose state is no longer resident.
-
-    Distinct from ``SessionAdmissionError``: the session was admitted once, and
-    the history a continuation needs is gone. Raised rather than silently
-    returning a fresh session, because per-session state such as a VAE
-    causal-convolution cache has no recompute source -- continuing on empty state
-    produces normal-looking but wrong output. The caller must start a new session
-    explicitly.
-    """
+    """Continuation has no resident history; an explicit new session is required."""
 
 
 class SessionState:
@@ -136,12 +123,8 @@ class SessionStateManager:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         self.max_sessions = max_sessions
-        # What to do when a new session arrives at ``max_sessions``. The default
-        # keeps the count-based LRU below. ``False`` makes admission fail instead,
-        # for a model whose per-session state cannot be rebuilt: there, dropping
-        # the oldest entry silently strands history a later continuation needs, so
-        # refusing the *new* session is the safe answer. Opt-in so models already
-        # relying on eviction are unaffected.
+        # Preserve LRU by default; models with unrecoverable history opt into
+        # rejecting new sessions at capacity.
         self.evict_when_full = evict_when_full
         # Recorded for observability; enforcement is left to an eviction
         # planner (see RFC #4480). Not scoped to a device: which pool a budget
@@ -171,9 +154,6 @@ class SessionStateManager:
             session = self._sessions.get(key)
             if session is None:
                 if not self.evict_when_full and len(self._sessions) >= self.max_sessions:
-                    # Admission, not eviction: the resident sessions keep history
-                    # that cannot be rebuilt, so the new one is refused rather
-                    # than paid for by stranding an existing session's state.
                     raise SessionAdmissionError(
                         f"cannot admit session {key!r}: {len(self._sessions)} of {self.max_sessions} "
                         "session slots are in use and this store is configured not to evict. "
@@ -216,20 +196,10 @@ class SessionStateManager:
             return True
 
     def raise_max_sessions(self, max_sessions: int) -> bool:
-        """Raise the LRU bound, never lower it. Returns whether it changed.
+        """Raise the session limit without making existing sessions evictable.
 
-        An owner that only learns how many sessions will really be live *after*
-        construction -- an engine publishing its own memory-derived capacity, say
-        -- has to be able to lift the bound, or this table evicts sessions that
-        owner still considers live.
-
-        Lowering is refused rather than honoured: already-resident sessions would
-        become evictable mid-life, and the overflow path in
-        ``get_or_create_session`` drops the table entry *without* resetting
-        buffers, so the next lookup silently returns a fresh ``SessionState`` and
-        the accumulated history is gone with no error. Shrinking a live bound is
-        never what a caller wants; call ``drop_session`` to release a session
-        deliberately.
+        Return whether the limit changed. Lowering is ignored; use
+        ``drop_session`` to release state explicitly.
         """
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")

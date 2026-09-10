@@ -77,28 +77,13 @@ MAX_DREAMZERO_SESSIONS = 64
 # entries. This is the measured persistent CUDA upper bound per live session.
 DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 
-# How many per-session states the pipeline admits at once. Deliberately far
-# below ``MAX_DREAMZERO_SESSIONS``: that is a count of *KV* slots, which the KV
-# manager then shrinks to fit its own budget, whereas this bounds *model-owned*
-# state at DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION each. At 603 MiB per
-# session, 64 resident states would be 38.6 GiB -- more than a whole device --
-# so reusing the KV count here would be a bound that can never fire before OOM.
+# Bound model-owned state separately from KV slots. DreamZero keeps VAE
+# causal history that cannot be reconstructed, so capacity pressure must
+# reject new sessions rather than evict live history.
 #
-# This is an *admission* limit, not an eviction threshold. Per-session state
-# includes the Wan VAE causal-convolution cache, which has no recompute source:
-# rebuilding it would mean re-encoding the whole observation history, which is
-# not retained. So a full table refuses the *new* session rather than dropping an
-# existing one -- continuing a session on freshly created state would silently
-# restart its rollout and return normal-looking but wrong output.
-#
-# Sessions are normally released by the AR-Diffusion runner's explicit
-# close/reset. A deployment that holds session state on a stage with no runner
-# (the disaggregated encode stage, where ``engine_backend: ARDiffusionEngine`` is
-# set on denoise only) never receives that signal, so finished sessions are never
-# released and admission eventually fails. That is the missing signal surfacing,
-# not this bound misbehaving. Raise it with
-# OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS if a deployment genuinely
-# interleaves more live sessions than this.
+# The runner releases state on close/reset. Stages without that runner need
+# close propagation or will eventually reach this bound. Configure genuine
+# concurrency via OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS.
 MAX_RESIDENT_DREAMZERO_SESSION_STATES = 4
 
 # The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
@@ -494,12 +479,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.num_frame_per_block: int = ah_config["num_frame_per_block"]
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
-        # Opt-in: back per-session state with the shared SessionStateManager
-        # (RFC #4480). Default off -> the bespoke DreamZeroState path above.
-        # One resolved cap drives *both* stores, and both refuse rather than
-        # evict: ``_states`` via ``_admit_session_state()`` and the manager via
-        # ``evict_when_full=False``. Sizing or policing them separately is how a
-        # bound ends up enforced on only one of the two paths a deployment takes.
+        # The optional shared manager and the default store use the same admission
+        # limit and reject-on-full policy.
         self._use_memory_manager, mm_max_sessions = resolve_session_state_config(
             enable=od_config.enable_session_state_manager,
             max_sessions=MAX_RESIDENT_DREAMZERO_SESSION_STATES,
@@ -594,7 +575,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         session_key = str(session_id or "default")
         state = self._states.get(session_key)
         if state is None:
-            # Only an insert can exceed the bound; a hit just reorders.
             self._admit_session_state(session_key)
             state = DreamZeroState()
             self._states[session_key] = state
@@ -603,23 +583,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return state
 
     def _require_session_state(self, session_id: str | None) -> DreamZeroSessionState:
-        """Return an already-admitted session's state, or fail.
-
-        The continuation counterpart to ``_get_or_create_state()``. A request that
-        continues a session must find the state that session built up; creating a
-        fresh one instead would silently restart the rollout, because
-        ``reset_reason()`` reports ``"session"`` for empty state and the pipeline
-        would quietly re-initialise. The Wan VAE causal-convolution cache has no
-        recompute source, so the history cannot be reconstructed -- and on a
-        disaggregated deployment the denoise stage's KV for this session is still
-        live, so the two stages would silently disagree. Fail instead.
-        """
+        """Require resident state for continuation; never create replacement history."""
         session_key = str(session_id or "default")
         manager = getattr(self, "_memory_manager", None)
         if manager is not None:
-            # Check membership before building the adapter: the adapter's
-            # constructor calls get_or_create_session(), which would create the
-            # very state whose absence we are trying to report.
+            # Check membership first: constructing the adapter would create missing
+            # state and bypass continuation validation.
             if session_key not in manager:
                 raise SessionStateLostError(self._session_state_lost_message(session_key))
             return DreamZeroStateAdapter(
@@ -635,18 +604,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     @staticmethod
     def _request_begins_session(extra_args: Mapping[str, object]) -> bool:
-        """Whether this request begins a session, read the way the runner reads it.
-
-        A typed tick namespaces its fields under ``AR_DIFFUSION_TICK_KEY`` and
-        does *not* duplicate them at the top level, while the tick's own
-        ``extra_args`` is merged onto a static per-deployment template
-        (``ARDiffusionConsumer._sampling_params_for_tick``). So the flat key alone
-        cannot express per-request begin/continue on the tick path. The runner
-        releases the old session on the tick's value
-        (``ARDiffusionModelRunner.execute_model``), so reading a different source
-        here would leave the forward demanding state the runner just dropped.
-        Either source saying "begin" counts.
-        """
+        """Treat either the typed tick or flat reset flag as a session begin."""
         tick = extra_args.get(AR_DIFFUSION_TICK_KEY)
         if isinstance(tick, Mapping) and bool(tick.get("reset", False)):
             return True
@@ -662,17 +620,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
     def _admit_session_state(self, session_key: str) -> None:
-        """Refuse a new session once the resident bound is reached.
-
-        Admission rather than eviction: every resident state holds history that
-        cannot be rebuilt, so the new session is refused instead of being paid for
-        by stranding an existing one. Sessions are normally released by the
-        AR-Diffusion runner's explicit close/reset, so reaching this bound means
-        either more sessions are genuinely live at once than the cap allows, or a
-        stage is holding finished sessions because that signal never arrived.
-        """
-        # getattr guards lightweight test fixtures that build the pipeline via
-        # __new__ and seed only ``_states``.
+        """Reject a new session at capacity, preserving all resident states."""
+        # Allow lightweight fixtures that initialize only _states.
         max_states = getattr(self, "_max_session_states", MAX_RESIDENT_DREAMZERO_SESSION_STATES)
         if max_states <= 0 or len(self._states) < max_states:
             # Non-positive means "no bound".
@@ -689,20 +638,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
     def set_resident_session_state_capacity(self, capacity: int) -> None:
-        """Raise the admission bound to a runner's own session capacity.
+        """Raise both stores' admission limits to the runner's resident capacity.
 
-        The AR-Diffusion runner derives a memory-safe session capacity that
-        already reserves ``model_owned_state_bytes_per_session`` per session, and
-        will keep that many live. Lifting our bound to match keeps us from
-        refusing a session the engine has room for. Where there is no runner to
-        publish a capacity (a disaggregated stage that holds session state without
-        hosting the engine) the configured cap governs, which is exactly where the
-        bound has to do the work.
-
-        Both stores are raised together. The manager is constructed in
-        ``__init__`` with the configured cap, so lifting only
-        ``_max_session_states`` would leave the manager path refusing at the lower
-        bound while the bespoke path admitted.
+        The runner budgets model-owned state per session. Without a publishing
+        runner, the configured limit applies. Never lower a live limit.
         """
         capacity = int(capacity)
         if capacity <= 0:
@@ -1217,8 +1156,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def decode_accumulated_video_latents(self, session_id: str | None = None) -> torch.Tensor:
         """Decode all AR-chunk latents accumulated for ``session_id``."""
-        # Export consumes an existing session's history; it must never be the
-        # thing that creates the session.
         state = self._require_session_state(session_id)
         latents = state.get_concatenated_video_latents()
         if latents is None:
@@ -1535,10 +1472,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 )
             raise KeyError("robot_obs")
         session_id = str(extra_args.get("session_id") or "default")
-        # ``reset`` is the protocol's begin-vs-continue signal (see the AR runner,
-        # which releases the old session on it). Only a begin may create state: a
-        # continuation must find the history its session built up, or fail loudly
-        # rather than restart the rollout on empty state.
+        # Only a begin may create state; continuations require existing history.
         if self._request_begins_session(extra_args):
             state = self._get_or_create_state(session_id)
         else:

@@ -200,24 +200,11 @@ class StageExecutionType(str, Enum):
 
 
 class DiffusionStageRole(str, Enum):
-    """Role of a diffusion stage within a (possibly disaggregated) pipeline.
+    """Component role within a diffusion pipeline, independent of engine type.
 
-    ``execution_type`` answers *which engine* runs a stage; ``stage_role`` is an
-    orthogonal axis that answers *which slice of a diffusion model* the stage
-    runs. Splitting a single diffusion model across stages by role lets many
-    DiT-style models become disaggregatable through configuration alone, with no
-    per-model source changes:
-
-    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
-                   stage. This is the default / single-stage behavior.
-    - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
-                   embeddings for a downstream stage.
-    - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
-                   and emit latents for a downstream decode stage.
-    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
-                          generation stage of E/G disaggregation).
-    - ``DECODE``:  run only the VAE decode / postprocess on upstream latents
-                   (the trailing stage of a 3-way E/G/D split).
+    FULL runs all phases; ENCODE produces conditioning; DENOISE produces
+    latents; DENOISE_DECODE also decodes them; DECODE decodes or postprocesses
+    upstream output.
     """
 
     FULL = "full"
@@ -227,9 +214,7 @@ class DiffusionStageRole(str, Enum):
     DECODE = "decode"
 
 
-# Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
-# a free-form string ("text_encode"/"dit") before roles existed; keep the map so
-# older stage configs and deploy YAML keep working.
+# Map legacy model_stage names for existing stage configs and deploy YAML.
 _MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
     "text_encode": DiffusionStageRole.ENCODE,
     "encode": DiffusionStageRole.ENCODE,
@@ -247,12 +232,7 @@ def resolve_diffusion_stage_role(
     stage_role: DiffusionStageRole | str | None,
     model_stage: str | None = None,
 ) -> DiffusionStageRole:
-    """Resolve the effective diffusion stage role.
-
-    Prefers an explicit ``stage_role`` and otherwise falls back to the legacy
-    free-form ``model_stage`` string. Unknown values resolve to ``FULL`` so a
-    plain single-stage diffusion model keeps running the whole pipeline.
-    """
+    """Resolve explicit stage_role, then legacy model_stage, defaulting to FULL."""
     if isinstance(stage_role, DiffusionStageRole):
         return stage_role
     if isinstance(stage_role, str) and stage_role:
@@ -301,10 +281,7 @@ class StagePipelineConfig:
     stage_id: int
     model_stage: str
     execution_type: StageExecutionType = StageExecutionType.LLM_AR
-    # Diffusion-only: which slice of a diffusion model this stage runs
-    # (encode / denoise / decode / full). Orthogonal to ``execution_type`` and
-    # only meaningful when ``execution_type == DIFFUSION``. ``None`` falls back
-    # to ``model_stage`` (legacy) and ultimately to ``FULL``.
+    # Diffusion component role; None falls back through model_stage to FULL.
     stage_role: DiffusionStageRole | None = None
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
@@ -329,14 +306,9 @@ class StagePipelineConfig:
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
-    # Payload keys this stage expects to receive from its upstream stage over
-    # the omni connector instead of through the orchestrator IPC hop. Declaring
-    # them is what enables the worker-side connector receive path, so an empty
-    # tuple leaves existing deployments untouched.
+    # Declared receive payload keys; empty disables stage-payload reception.
     stage_input_payload_keys: tuple[str, ...] = ()
-    # Mirror of the above on the producing side: keys this stage hands to the
-    # next stage over the connector. Only diffusion producers need this; AR
-    # stages already send through ``send_full_payload_outputs``.
+    # Declared send payload keys for diffusion producers; empty disables sending.
     stage_output_payload_keys: tuple[str, ...] = ()
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
@@ -1198,9 +1170,6 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
-        # Diffusion disaggregation stage role (see DiffusionStageRole). Only
-        # surfaced when set so non-diffusion stages are unaffected; the payload
-        # key schema rides along in ``yaml_engine_args``.
         if self.stage_role is not None:
             engine_args["stage_role"] = self.stage_role
         if self.worker_type:

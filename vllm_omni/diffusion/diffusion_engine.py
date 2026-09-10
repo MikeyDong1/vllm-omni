@@ -532,8 +532,7 @@ class DiffusionEngine:
         logger.debug("Generation completed successfully.")
 
         if output.output is None:
-            # A non-final diffusion stage (encode-only, denoise-only) carries its
-            # payload forward in custom_output even though it emits no media.
+            # Non-final stages may carry a payload without emitting media.
             custom_output = output.custom_output or {}
             if not custom_output:
                 logger.warning("Output is None, returning empty OmniRequestOutput")

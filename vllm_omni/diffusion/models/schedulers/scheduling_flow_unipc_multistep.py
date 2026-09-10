@@ -27,28 +27,12 @@ from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
 
 
 def _small_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-    """Solve ``matrix @ x = rhs`` for the tiny systems UniPC actually builds.
+    """Solve 1x1/2x2 systems in closed form; delegate larger systems.
 
-    At the deployed ``solver_order=2`` the UniC corrector solves a **2x2** system on
-    every denoise step, and the predictor a 1x1 or 2x2. Dispatching the general
-    LAPACK/oneMKL path for that is pure overhead: it allocates workspaces and runs LU
-    with partial pivoting for a system that has a two-line closed form.
-
-    Closed form via Cramer's rule for n <= 2; anything larger falls through to
-    :func:`safe_linalg_solve` unchanged, so higher solver orders keep their exact
-    current behaviour -- including its numpy fallback for ROCm wheels whose CPU LAPACK
-    probe reports support they do not have. That fallback matters *more* after this
-    change, not less: it only triggers for CPU matrices, and ``matrix``/``rhs`` are
-    host tensors now.
-
-    ``torch.linalg.solve`` semantics are matched deliberately:
-
-    * **Singular input raises.** The general solve raises ``LinAlgError`` rather than
-      returning inf/nan, and Cramer's rule would silently divide by zero, so an
-      exactly-zero determinant is turned back into a real error. UniPC's ``R`` is a
-      Vandermonde matrix in ``rks``, singular only when two ``rk`` values coincide --
-      itself a degenerate step, so raising is right.
-    * **Dtype and device follow the inputs**, as they would from the general solve.
+    Uses Cramer's rule for small systems and ``safe_linalg_solve`` otherwise.
+    Exactly singular systems raise ``LinAlgError`` instead of returning inf/nan.
+    Dtype and device follow the inputs; the delegated path retains its
+    platform-specific fallback.
     """
     n = matrix.shape[-1]
     if n == 1:
@@ -335,11 +319,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 "is now handled via an internal counter `self.step_index`",
             )
 
-        # D3: keep sigma on the host. It is a 0-d CPU scalar that only ever
-        # multiplies/subtracts against `model_output`/`sample` (device tensors),
-        # and PyTorch broadcasts a CPU 0-d tensor against a device tensor without
-        # requiring an explicit transfer. The two `.to(sample.device)` calls here
-        # were 2 tiny H2D copies per denoise step for no benefit.
+        # Keep sigma on CPU: PyTorch broadcasts a CPU 0-d scalar against device
+        # tensors without an explicit transfer.
         sigma = self.sigmas[self.step_index]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
 
@@ -423,31 +404,11 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             return x_t
 
         device = sample.device
-        # ---- D3: keep the sigma/lambda/h scalar chain on the HOST ----------
-        # self.sigmas is deliberately CPU-resident (set_timesteps does
-        # `self.sigmas = self.sigmas.to("cpu")`). The old code moved each element
-        # to the device FIRST, so every scalar derived from it -- alpha, sigma,
-        # lambda, h, rk, the b coefficients -- became a device 0-d tensor. The
-        # subsequent `torch.tensor(rks, device=device)` and `torch.tensor(b, ...)`
-        # then had to read those device scalars back, forcing a blocking D2H
-        # synchronize per scheduler step (~12.4 ms/step, ~206 ms/request).
-        #
-        # These are 1-3 element scalars: computing them on CPU costs microseconds
-        # and needs no transfer at all. Device tensors are only produced where the
-        # value actually multiplies a device tensor -- and PyTorch broadcasts a
-        # CPU 0-d tensor against a device tensor natively, so even those need no
-        # explicit .to(device). (Verified on torch 2.12.0+xpu: mul/sub/rsub/div and
-        # the expm1 chain all accept a CPU 0-d scalar against an XPU tensor, and are
-        # ~20% FASTER than the device-scalar form. torch.einsum is the exception --
-        # it requires same-device operands -- which is why rhos is still moved
-        # explicitly below.)
-        #
-        # dtype is unchanged: self.sigmas is float32, so every derived scalar stays
-        # float32 exactly as before. Results are bitwise identical for mul/sub, and
-        # differ by <=1 ULP of float32 (~1e-6 relative) for division, because a
-        # CPU-scalar divide and a device-scalar divide round the reciprocal
-        # differently. That is round-off, not a semantic change -- see the D3 note
-        # on numerical validation.
+        # Keep the sigma -> alpha/lambda -> h/rk/b scalar chain on CPU to avoid
+        # device-to-host synchronization when building the coefficient tensors.
+        # The derived scalars retain self.sigmas' float32 dtype. CPU 0-d scalars
+        # broadcast against device tensors; einsum coefficients need an explicit
+        # transfer because its operands must share a device.
         sigma_t_c, sigma_s0_c = (
             self.sigmas[self.step_index + 1],
             self.sigmas[self.step_index],
@@ -465,19 +426,16 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         for i in range(1, order):
             si = self.step_index - i
             mi = model_output_list[-(i + 1)]
-            # sigmas[si] stays on CPU: lambda_si/rk are host scalars.
             alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
             assert mi is not None
-            # mi/m0 ARE device tensors; dividing by a CPU 0-d scalar broadcasts
-            # without a transfer and keeps the result on the device.
+            # Dividing device tensors by a CPU 0-d scalar preserves their device.
             D1s.append((mi - m0) / rk)
 
         rks.append(torch.ones((), dtype=h.dtype))
-        # Built from CPU scalars -> a CPU stack, no D2H sync. Previously this
-        # line was `torch.tensor(rks, device=device)` over device 0-d tensors.
+        # Stack host scalars without a device-to-host readback.
         rks = torch.stack(rks)
 
         R = []
@@ -511,8 +469,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
                 assert isinstance(R, torch.Tensor)
-                # Solve on CPU (R/b are now host tensors), then move the 1-3
-                # element result to the device in ONE transfer.
+                # Move the host solve result to the device for einsum.
                 rhos_p = _small_solve(R[:-1, :-1], b[:-1]).to(device=device, dtype=x.dtype)
         else:
             D1s = None
@@ -587,7 +544,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         model_t = this_model_output
 
         device = this_sample.device
-        # ---- D3: host-side scalar chain, same rationale as the predictor -----
+        # Keep this scalar chain on CPU, as in the predictor.
         sigma_t_c, sigma_s0_c = (
             self.sigmas[self.step_index],
             self.sigmas[self.step_index - 1],
@@ -648,10 +605,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            # This is THE hot solve: at the deployed solver_order=2 the corrector
-            # runs order=2 on every step, so a general LAPACK solve was being
-            # dispatched 16x/request for a 2x2 system. _small_solve uses the
-            # closed form for 2x2 and falls back to safe_linalg_solve otherwise.
+            # Solve coefficients on CPU; einsum below consumes them on the device.
             rhos_c = _small_solve(R, b).to(device=device, dtype=x.dtype)
 
         if self.predict_x0:

@@ -208,13 +208,8 @@ class ARDiffusionPagedForwardContext:
         only consumes prebuilt tensors via ``ARDiffusionPagedLayerInputs``.
         """
         if getattr(self, "_prepared", False):
-            # Reused for a later denoise step: the session cache handed this same
-            # object back, so the block table, slot mappings and metadata tensors
-            # are already built and still valid. But the cache key covers seq_len
-            # and the commit epoch, while action_len/query_len arrive here as
-            # separate arguments -- if either moved, the cached block table is
-            # wrong for this call and silently reusing it would corrupt attention
-            # addressing. Fail loud rather than compute a wrong answer.
+            # The cached addressing is reusable, but query_len and action_len are not
+            # in the key. Reject geometry changes before using stale slot mappings.
             if int(query_len) != int(self.query_len) or int(action_len) != int(self._action_len):
                 raise RuntimeError(
                     "AR-Diffusion paged context reused with different geometry: "
@@ -504,13 +499,8 @@ def _paged_write_attn_impl(
     max_seq_len: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    # index_copy_ rather than ``pool[slots] = value``: the slot ids are unique by
-    # construction (one KV slot per distinct token -- a duplicate would already be
-    # cache corruption), so the duplicate-index and accumulate semantics that
-    # advanced indexing has to support are dead weight here. index_copy_ states
-    # that precondition in the API and takes the plain scatter path. Semantics are
-    # otherwise identical: for a 1-D integer index along dim 0 with unique
-    # entries, ``pool[slots] = v`` IS ``pool.index_copy_(0, slots, v)``.
+    # Slot indices are unique: each token owns one slot, so index_copy_
+    # preserves the assignment semantics without duplicate-index handling.
     key_pool.index_copy_(0, video_slots, k_curr.to(key_pool.dtype))
     value_pool.index_copy_(0, video_slots, v_curr.to(value_pool.dtype))
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:

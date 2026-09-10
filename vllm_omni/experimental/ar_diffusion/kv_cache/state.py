@@ -58,19 +58,9 @@ class ARDiffusionKVState:
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
         self._closed = False
 
-        # Forward-context reuse across denoise steps. A fresh
-        # ARDiffusionPagedForwardContext used to be built on every DiT forward, so
-        # prepare() re-did the whole host-side setup 17x per request: CPU arange,
-        # compute_slot_mapping, the padded block table, three H2D copies and one
-        # layer-context object per layer.
-        #
-        # Inside the denoise loop the KV mapping does not move -- the pipeline
-        # calls in with commit_current=False there, so nothing is allocated or
-        # committed. Only the prefill/commit forwards change the mapping. So one
-        # context per (branch, geometry, commit epoch) serves every step in between.
-        #
-        # One entry per KV branch, never more: a new key evicts the old one, so the
-        # cache cannot grow and cannot keep a finished request's tensors alive.
+        # Reuse one context per KV branch while read-only denoise steps keep the
+        # mapping fixed. Commit, close and reset invalidate it; a key change drops
+        # the old entry before allocation, bounding retained device tensors.
         self._paged_cache: dict[str, _FctxCacheEntry] = {}
         self._fctx_commit_seq = 0
         self.fctx_counters: dict[str, int] = {
@@ -126,15 +116,13 @@ class ARDiffusionKVState:
 
         adapter = self.adapter(kv_branch)
 
-        # Reuse the forward context when the KV mapping cannot have moved.
         cache_key = self._fctx_cache_key(kv_branch, adapter, seq_len, commit_current)
         cached = self._paged_cache.get(kv_branch)
         if cached is not None:
             prev_key, prev_ctx, prev_layers = cached
             if prev_key == cache_key:
                 self.fctx_counters["fctx_cache_hit"] += 1
-                # Re-publish as the pending context so commit_paged_context() and
-                # the "replaced before commit" guard above still see it.
+                # Keep commit handling and the pending-context guard aware of a cache hit.
                 self._paged_pending[kv_branch] = prev_ctx
                 return prev_layers
             self.fctx_counters["fctx_cache_invalidate"] += 1
@@ -144,8 +132,7 @@ class ARDiffusionKVState:
                 kv_branch,
                 self._fctx_last_miss_reason,
             )
-            # Drop the stale entry before building the replacement so its device
-            # tensors are not held alongside the new ones.
+            # Release stale device tensors before allocating their replacement.
             self._paged_cache.pop(kv_branch, None)
         else:
             self._fctx_last_miss_reason = "no entry for branch"
@@ -172,9 +159,7 @@ class ARDiffusionKVState:
             bool(commit_current),
         )
         layers = [ARDiffusionPagedLayerContext(layer_idx=i, forward_ctx=forward_ctx) for i in range(self.num_layers)]
-        # Cache the layer-context list too: they are immutable objects wrapping
-        # only (layer_idx, forward_ctx), so rebuilding them per forward is pure
-        # allocation churn.
+        # The immutable layer wrappers can be reused with their forward context.
         self._paged_cache[kv_branch] = (cache_key, forward_ctx, layers)
         return layers
 
@@ -185,20 +170,11 @@ class ARDiffusionKVState:
         seq_len: int,
         commit_current: bool,
     ) -> tuple:
-        """Every value that can change the forward context's addressing.
+        """Host-only addressing key; checking a hit must not synchronize the device.
 
-        Built from host-side ints only -- no tensor reads, so validating a hit
-        costs no device synchronization. A sync here would defeat the purpose.
-
-        Deliberately conservative:
-          * ``commit_current=True`` makes the key unique per call via the epoch
-            token, so a committing forward never reuses a cached entry and never
-            has its own entry reused. Only the read-only denoise-loop forwards
-            are shared.
-          * ``num_computed_tokens`` and the committed-token counter both advance on
-            commit, so a post-commit forward cannot match a pre-commit key.
-          * ``window_block_ids`` changes length when the sliding window evicts,
-            which changes the block table.
+        Token counters and window geometry track mapping changes. Committing
+        forwards use unique epoch tokens so they can neither reuse nor lend
+        cached contexts; only read-only denoise forwards are shared.
         """
         return (
             self.session_id,
@@ -206,13 +182,10 @@ class ARDiffusionKVState:
             id(adapter),
             int(seq_len),
             bool(commit_current),
-            # KV "version": both advance on commit, so they act as the epoch.
             int(self._committed.get(kv_branch, 0)),
             int(adapter.num_computed_tokens),
-            # Window geometry: affects history_block_ids and therefore the table.
             len(self.kv_cache.window_block_ids(adapter)),
             int(self.kv_cache.block_size),
-            # A committing forward must be unique: never share, never be shared.
             self._fctx_epoch_token(commit_current),
         )
 
@@ -281,11 +254,7 @@ class ARDiffusionKVState:
             )
         ctx.mark_committed()
         self._paged_pending[kv_branch] = None
-        # A commit advances the KV mapping (new resident blocks, possibly an
-        # eviction), so anything cached for this branch is stale. The key would
-        # already miss on committed_tokens/num_computed_tokens; dropping it here is
-        # the belt-and-braces guarantee against stale block-table or slot-mapping
-        # reuse, and it releases the device tensors immediately.
+        # Drop stale addressing and release its device tensors on commit.
         self._fctx_invalidate(kv_branch, reason="kv commit")
 
     def is_cross_attention_populated(self, kv_branch: str, cache_name: str) -> bool:
@@ -337,8 +306,6 @@ class ARDiffusionKVState:
             self.kv_cache.end_request(adapter)
         self.kv_cache.release_cross_attention(self.session_id)
         self._paged_pending = dict.fromkeys(self.adapters)
-        # Never let a cached context (and its device tensors) outlive the session:
-        # that would both leak and risk reuse against freed blocks.
         self._fctx_invalidate(reason="session close")
         self._closed = True
 
@@ -364,11 +331,8 @@ class ARDiffusionKVState:
         }
         self._committed = dict.fromkeys(self.adapters, 0)
         self._paged_pending = dict.fromkeys(self.adapters)
-        # reset() installs brand new adapters and zeroes the committed counters, so
-        # every cached block table and slot mapping now addresses blocks this
-        # session no longer owns. Drop unconditionally -- the keep_cross_attention
-        # branch above skips close(), so relying on close()'s invalidation alone
-        # would leave stale entries behind on exactly that path.
+        # Invalidate even when keep_cross_attention skips close(): reset installs
+        # new adapters, so old mappings no longer address this session's blocks.
         self._fctx_invalidate(reason="session reset")
         self._closed = False
         _log.info(

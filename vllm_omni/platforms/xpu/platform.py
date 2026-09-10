@@ -21,17 +21,8 @@ torch.accelerator.get_memory_info = lambda device=None: torch.xpu.mem_get_info(d
 # The XPU sampler kernel is broken for omni on the current vLLM; use the native path.
 os.environ.setdefault("VLLM_XPU_USE_SAMPLER_KERNEL", "0")
 
-# oneCCL exchanges Level Zero memory handles on every collective. The `sockets`
-# mode is measurably slower than the fd-passing modes on PCIe-connected XPUs:
-# DreamZero at TP=4 went from an end-to-end median of 5862.0 ms to 5471.9 ms
-# (-6.65%), denoise-phase device time -8.54%, over 20 requests per mode in
-# interleaved series.
-#
-# `pidfd` measures the same within noise (win rate 0.522) but additionally needs
-# pidfd_open/pidfd_getfd (kernel >= 5.6) *and* all ranks in one PID namespace.
-# `drmfd` only needs DRM fd passing, which the /dev/dri mount XPU already
-# requires, so it is the more portable of the two. setdefault, so an explicit
-# CCL_ZE_IPC_EXCHANGE=sockets still wins if a deployment hits IPC trouble.
+# Use DRM fd passing for oneCCL IPC on XPU; unlike pidfd, it does not
+# require ranks to share a PID namespace. Preserve explicit overrides.
 os.environ.setdefault("CCL_ZE_IPC_EXCHANGE", "drmfd")
 
 

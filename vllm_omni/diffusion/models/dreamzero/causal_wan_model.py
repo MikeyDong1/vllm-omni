@@ -70,14 +70,10 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
 
 
 def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
-    """Precompute complex-valued RoPE frequencies (polar form).
+    """Precompute complex64 RoPE frequencies of shape [max_seq_len, dim // 2].
 
-    The angles are accumulated in float64 -- at the far end of the table they
-    reach 1e4 radians, where float32 would resolve them to only ~1e-3 -- and the
-    table is handed out as complex64, since cos and sin land in [-1, 1] and the
-    rotation they feed ends in bfloat16.
-
-    Returns: complex tensor [max_seq_len, dim // 2]
+    Accumulate angles in float64 to preserve precision at large positions;
+    cos/sin values and the downstream bfloat16 rotation need less precision.
     """
     if dim % 2 != 0:
         raise ValueError(f"dim must be even, got {dim}.")
@@ -90,27 +86,11 @@ def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
 
 
 def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply RoPE to x, with ``freqs`` as a real ``(..., 2)`` cos/sin table.
+    """Apply float32 RoPE using a real ``(..., 2)`` cos/sin table.
 
-    Two forms of the same rotation, picked by whether inductor is generating code.
-
-    Compiled: inductor cannot generate code for complex operators, so a complex
-    multiply here falls back to eager, and being opaque to the scheduler it also
-    splits the surrounding qk-norm and layout work into separate fusion groups.
-    Written out in real arithmetic the whole segment fuses instead, measured on
-    gfx950 as three kernels collapsing to one.
-
-    Eager: the real form is the slower one by about 4x, because each of its
-    multiply-adds becomes its own pass over a temporary while the complex
-    multiply is a single elementwise kernel.
-
-    Both branches evaluate the same products in the same order and agree bitwise
-    once the caller casts back to bfloat16.
-
-    The rotation runs in float32. Only the angles need anything wider, and they
-    are already spent by the time ``rope_params`` hands over cos and sin: those
-    live in [-1, 1], where float32 carries four more decimal digits than the
-    bfloat16 this result is cast back to.
+    Compiled execution uses real arithmetic so Inductor can generate and
+    fuse the rotation; eager execution uses a complex multiply to avoid
+    multiple elementwise passes. The caller casts the result back to its dtype.
     """
     B, seq_len, n, _ = x.shape
     pairs = x.to(torch.float32).reshape(B, seq_len, n, -1, 2)
@@ -151,17 +131,10 @@ def rope_action_apply(
 
 
 def _mark_seq_dynamic(t: torch.Tensor | None, dim: int) -> None:
-    """Tell Dynamo that ``dim`` varies, so one graph serves every query length.
+    """Best-effort hint that ``dim`` varies across requests.
 
-    ``setup_compile()`` passes ``dynamic=False``, which disables *automatic* dynamic-shape
-    inference but does not override an explicit hint: verified on torch 2.12.0+xpu, four
-    distinct sequence lengths collapse from four compilations to one, with fusion quality
-    and kernel timings within ~2% of the static build.
-
-    Best-effort and silent on purpose. Under ``enforce_eager: true`` there is no
-    compilation to influence and marking is a harmless no-op, and ``mark_dynamic`` raises
-    if the tensor was already marked or is a view whose base cannot carry the hint. A
-    RoPE shape hint is never worth failing a request over.
+    Explicit hints work even when automatic dynamic-shape inference is
+    disabled. Unsupported hints must not fail an inference request.
     """
     if t is None:
         return
@@ -172,34 +145,11 @@ def _mark_seq_dynamic(t: torch.Tensor | None, dim: int) -> None:
 
 
 def _materialize_block_freqs(freqs: torch.Tensor) -> torch.Tensor:
-    """Real ``(..., 2)`` cos/sin table as a freshly allocated tensor, not a view.
+    """Materialize a real cos/sin table that can carry dynamic-shape hints.
 
-    ``view_as_real`` on its own returns a *view*, and both of the reasons this matters
-    are about what the compiled block sees, not about the values:
-
-    1. ``torch._dynamo.mark_dynamic`` cannot always place a hint on a view -- it raises
-       when the base cannot carry it. The next commit marks this table's sequence dim,
-       and on a view that marking silently does nothing, which quietly costs one graph
-       per query length. A real allocation always carries the hint.
-    2. Dynamo guards on the tensor's dispatch key set, and the two branches of
-       :func:`causal_rope_action_freqs` reach ``view_as_real`` with different bases: the
-       no-action branch views the table handed down from ``_create_freqs``, while the
-       action branch views a ``torch.cat`` performed here. Under ``inference_mode`` those
-       do not reliably agree -- a tensor viewed out of a longer-lived buffer keeps
-       ``(XPU, ADInplaceOrView, AutogradXPU, AutocastXPU)`` where a freshly allocated one
-       carries ``(XPU, AutocastXPU)`` -- and a mismatch makes prefill and diffuse
-       guard-incompatible, costing a second graph:
-
-           tensor 'freqs' dispatch key set mismatch. expected
-           DispatchKeySet(XPU, BackendSelect, ADInplaceOrView), actual
-           DispatchKeySet(XPU, BackendSelect)
-
-       Allocating on both paths makes the branches hand the block the same flavour of
-       tensor by construction.
-
-    ``.contiguous()`` is not a substitute: on an already-contiguous view it returns the
-    same view and drops nothing. The copy is of a table four orders of magnitude smaller
-    than the activations it rotates, once per forward against the 80 rotations it feeds.
+    A fresh allocation avoids view-base restrictions and normalizes tensor
+    metadata across branches. ``contiguous()`` cannot guarantee this because
+    it may return an already-contiguous view unchanged.
     """
     return torch.view_as_real(freqs).clone()
 
@@ -213,19 +163,10 @@ def causal_rope_action_freqs(
     num_state_per_block: int,
     action_state_index: int,
 ) -> torch.Tensor:
-    """Video RoPE table with the current step's action/state rows appended.
+    """Build the video RoPE table with this step's action/state rows appended.
 
-    Single inference step (causal / KV-cache mode). A function of the step index
-    only, so all layers and both q and k share one build -- see ``_forward_blocks``,
-    which calls this once per forward and passes the result down.
-
-    Returned as a real ``(..., 2)`` cos/sin table: the complex form is only used
-    to build it, so no complex tensor reaches the compiled blocks, where inductor
-    would fall back to eager. Converting here costs one view of a table that is
-    four orders of magnitude smaller than the tensors it rotates.
-
-    Both exits route through :func:`_materialize_block_freqs`, which is what makes the
-    table markable and its dispatch key set branch-independent.
+    All layers share the real table, keeping complex operators outside
+    compiled blocks. See ``_materialize_block_freqs`` for its allocation contract.
     """
     if action_register_length is None:
         return _materialize_block_freqs(freqs)
@@ -1087,8 +1028,7 @@ class CausalWanModel(nn.Module):
             )
             kv_cache = [c.to_layer_inputs() for c in kv_cache]
 
-        # Append this step's action/state RoPE rows once, outside the compiled blocks:
-        # the table is the same for all 40 layers and for both q and k.
+        # Build action/state RoPE rows once; all layers and both q/k share them.
         freqs = causal_rope_action_freqs(
             freqs,
             self.freqs_action,
@@ -1099,14 +1039,9 @@ class CausalWanModel(nn.Module):
             max(0, (current_start_frame - 1) // self.num_frame_per_block),
         )
 
-        # One graph for every AR geometry. x, e0 and freqs all carry the query-length
-        # dim, which is 880 (first prefill chunk), 1760 (later prefill) or 1785 (diffuse,
-        # +25 action/state registers). Unmarked, the block is retraced per length --
-        # "tensor 'e' size mismatch at index 1" -- so the table hoist above removes the
-        # redundant work but not the recompiles. These three hints are what collapse the
-        # lengths, and they need both of the preceding commits to bite: the table must be
-        # a real allocation to carry a hint at all, and paged_write_attn must stop passing
-        # max_query_len as a Python int or the graph re-specializes on that instead.
+        # Mark every query-length dimension to avoid per-length specialization.
+        # The RoPE table must be materialized and paged attention must use a
+        # symbolic query length for these hints to remain effective.
         _mark_seq_dynamic(x, 1)
         _mark_seq_dynamic(e0, 1)
         _mark_seq_dynamic(freqs, 0)

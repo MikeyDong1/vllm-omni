@@ -1,13 +1,7 @@
-# DreamZero-DROID deploy: TP=8 denoise, TP=8 UMT5 text encoder, CFG parallel disabled.
-#
-# Same stage shape as dreamzero_tp4.yaml, widened to 8 ranks (DiT num_heads=40
-# -> 5 heads/rank; UMT5 num_heads=64 -> 8/rank). This halves both the DiT and
-# the text-encoder footprint relative to TP=4, at the cost of more collectives
-# over narrower per-rank work; throughput at this width is unmeasured. The image
-# encoder and the Wan VAE stay replicated (~1.4 GiB combined).
-#
-# See dreamzero_tp4.yaml for the `text_encoder_tp_size` contract: 1, or equal to
-# `tensor_parallel_size`.
+# DreamZero-DROID: TP=8 denoise and text encoder, CFG parallel disabled.
+# DiT and UMT5 heads divide evenly across the eight ranks. CLIP and Wan VAE
+# remain replicated. See dreamzero_tp4.yaml for device placement and the
+# text_encoder_tp_size contract. Throughput at TP=8 is unmeasured.
 
 pipeline: dreamzero
 async_chunk: false

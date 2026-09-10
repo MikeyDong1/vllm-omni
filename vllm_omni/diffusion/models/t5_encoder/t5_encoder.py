@@ -287,14 +287,10 @@ class T5Block(nn.Module):
 class T5Stack(nn.Module):
     """Encoder stack for T5 (shared position bias) and UMT5 (per-layer bias).
 
-    ``per_layer_relative_attention_bias`` selects between the two families and
-    must stay consistent with ``forward``'s threading of ``position_bias``:
-    T5 computes the bias once on block 0 and reuses it, while UMT5 gives every
-    block its own ``relative_attention_bias`` table and recomputes per block
-    (HF ``UMT5LayerSelfAttention`` passes ``has_relative_attention_bias=True``
-    for every layer). Building the extra tables without also stopping the
-    threading would leave all but the first unused; stopping the threading
-    without building them would feed zeros into every block after the first.
+    UMT5 must both construct a bias table for each block and stop threading
+    ``position_bias`` between blocks. T5 computes it once on block 0 and
+    reuses it. Changing only construction or only forwarding would leave
+    bias tables unused or feed zero bias to later blocks.
     """
 
     def __init__(
@@ -458,18 +454,12 @@ class T5EncoderModel(nn.Module):
 
 
 class UMT5EncoderModel(T5EncoderModel):
-    """UMT5 encoder, tensor-parallel over the ambient vLLM TP group.
+    """UMT5 encoder using the ambient vLLM TP group.
 
-    A drop-in replacement for ``transformers.UMT5EncoderModel`` for inference.
-    UMT5 differs from T5 in exactly one structural way that matters here: every
-    block carries its own ``relative_attention_bias`` table instead of sharing
-    block 0's. Everything else T5's implementation already handles — gated-GELU
-    (``feed_forward_proj="gated-gelu"`` sets ``is_gated_act``), bias-free
-    linears, the tied ``shared``/``encoder.embed_tokens`` embedding,
-    bidirectional position buckets, and no query scaling before the softmax.
-
-    Note ``forward`` returns ``(hidden_states,)``, not a HF ``ModelOutput``, so
-    callers read ``[0]`` rather than ``.last_hidden_state``.
+    Each block owns its relative-attention bias. The T5 implementation supplies
+    gated-GELU, bias-free projections, tied embeddings, bidirectional buckets
+    and unscaled queries. ``forward`` returns ``(hidden_states,)`` rather than
+    a Hugging Face ModelOutput.
     """
 
     per_layer_relative_attention_bias = True

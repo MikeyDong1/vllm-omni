@@ -403,15 +403,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         tokenizer_source = od_config.model_paths.get("tokenizer", "google/umt5-xxl")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
 
-        # ---- Text encoder ----
-        # `text_encoder_tp_size` is the repository-wide knob
-        # (`DiffusionParallelConfig.text_encoder_tp_size`). DreamZero is a single
-        # diffusion stage, so the encoder runs inside the DiT's own worker and
-        # sharding it means riding the ambient vLLM TP group -- which is exactly
-        # the DiT's ranks. Matching the DiT TP size is therefore the only size
-        # that needs no process group of its own. A smaller encoder subgroup
-        # would need group-bound TP layers and belongs to stage topology, not to
-        # the encoder implementation.
+        # The text encoder runs inside the DiT worker: it must stay replicated or
+        # use the entire ambient DiT TP group. A smaller subgroup would require
+        # separate group-bound TP layers and stage topology.
         text_encoder_tp_size = int(getattr(od_config.parallel_config, "text_encoder_tp_size", 1))
         tensor_parallel_size = int(getattr(od_config.parallel_config, "tensor_parallel_size", 1))
         if text_encoder_tp_size not in (1, tensor_parallel_size):
@@ -439,16 +433,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             is_encoder_decoder=False,
         )
         if self._text_encoder_tp_enabled:
-            # Tensor-parallel UMT5 over the ambient TP group, so the ~10.6 GiB
-            # encoder is sharded instead of replicated on every rank.
-            # num_heads=64 and d_ff=10240 divide by every supported TP size.
-            # Returns a tuple, not a HF ModelOutput -- see `_encode_text`.
+            # Shard UMT5 on the ambient TP group; num_heads=64 and d_ff=10240 must
+            # divide by the TP size. _encode_text handles its tuple output.
             self.text_encoder = TPUMT5EncoderModel(umt5_config)
         else:
             self.text_encoder = HFUMT5EncoderModel(umt5_config)
-        # Both classes are named UMT5EncoderModel, so say which one. Requesting
-        # TP and silently getting the replicated encoder is otherwise invisible:
-        # startup succeeds and only the per-card footprint gives it away.
+        # Both implementations share a class name; log which was selected so an
+        # unexpected replicated encoder is visible at startup.
         logger.info(
             "DreamZero text encoder: %s UMT5 (text_encoder_tp_size=%d).",
             "tensor-parallel" if self._text_encoder_tp_enabled else "replicated Hugging Face",
@@ -713,11 +704,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # block stays fullgraph even on that path.
         dit_compile = {"mode": "default", "fullgraph": True, "dynamic": False}
 
-        # At TP>1 the text encoder is sharded, so its forward carries two
-        # all-reduces per layer. Compile those under `default` for the same
-        # reason the DiT blocks already do, rather than reduce-overhead's
-        # CUDAGraph buffer reuse around the new collectives. TP=1 keeps today's
-        # kwargs untouched.
+        # Use default compile mode for TP collectives, avoiding reduce-overhead
+        # CUDAGraph buffer reuse around all-reduces. Keep TP=1 settings unchanged.
         text_encoder_compile = {**compile_ro, "mode": "default"} if self._text_encoder_tp_enabled else compile_ro
 
         logger.info(
@@ -886,13 +874,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     # -----------------------------------------------------------------------
 
     def _encode_text(self, text_tokens: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Encode text prompt via UMT5.
+        """Encode text, returning full hidden states on every TP rank.
 
-        At ``text_encoder_tp_size > 1`` the encoder is tensor-parallel, so this
-        runs collectives on the DiT's TP group; the row-parallel projections
-        all-reduce back to the full 4096-dim hidden state, giving every rank the
-        identical result the DiT expects. The two implementations differ only in
-        how they wrap that tensor, and this method is the only place that knows.
+        The TP encoder runs collectives on the DiT group and returns a tuple;
+        the replicated HF encoder returns a ModelOutput.
         """
         self._cudagraph_mark_step_begin()
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
@@ -903,16 +888,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             prompt_emb = encoder_output.last_hidden_state
         prompt_emb = prompt_emb.to(dtype=torch.bfloat16)
-        # Zero the padding tail with a sync-free position mask. The previous loop
-        # sliced by elements of the device-resident `seq_lens`, forcing a
-        # device->host sync per row, which at TP>1 would sit inside a collective
-        # region. `where` (not a multiply) keeps the old `= 0` semantics exactly,
-        # and returns a fresh tensor, which is what the old `.clone()` was for:
-        # it decouples the result from a CUDAGraph-owned output buffer. Masking
-        # is per row here, where the old loop truncated every row to the
-        # shortest row's length. Both callers tokenize exactly one string, so
-        # B == 1 and the two agree today; the per-row form is the correct one if
-        # that ever stops being true.
+        # Mask padding per row without reading device-resident lengths on the host.
+        # where writes exact zeros and returns a fresh tensor, decoupling the result
+        # from any CUDAGraph-owned output buffer.
         positions = torch.arange(prompt_emb.shape[1], device=prompt_emb.device)
         keep = (positions.unsqueeze(0) < seq_lens.unsqueeze(1)).unsqueeze(-1)
         return torch.where(keep, prompt_emb, 0.0)
@@ -1870,18 +1848,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     continue
                 for new_name in mapped if isinstance(mapped, list) else [mapped]:
                     if self._text_encoder_tp_enabled:
-                        # Delegate to the encoder's own loader rather than
-                        # copying into the param: it is tensor-parallel, so each
-                        # param holds only this rank's shard and a full-width
-                        # `.data.copy_()` would raise. Its loader owns the
-                        # q/k/v -> qkv_proj and wi_0/wi_1 -> wi fusions (which
-                        # need shard ids) and the shared/embed_tokens alias. Fed
-                        # one key at a time to keep the checkpoint stream lazy.
+                        # The encoder loader owns TP shard slicing, qkv/wi fusions and embedding
+                        # aliases; copying full-width weights directly would fail. Feed one key at
+                        # a time to preserve lazy checkpoint loading.
                         for filled in self.text_encoder.load_weights([(new_name, tensor)]):
                             full_name = "text_encoder." + filled
-                            # The loader also reports pre-fusion checkpoint
-                            # names; keep only real parameters so the
-                            # pipeline-level coverage check stays meaningful.
+                            # Keep only real parameter names; the loader also reports pre-fusion names.
                             if full_name in params:
                                 loaded.add(full_name)
                     else:

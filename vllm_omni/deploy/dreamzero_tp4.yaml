@@ -1,14 +1,9 @@
-# DreamZero-DROID deploy: TP=4 denoise, TP=4 UMT5 text encoder, CFG parallel disabled.
-#
-# Topology is declared in vllm_omni/model_executor/models/dreamzero/pipeline.py.
-# `devices` are logical indices within the stage; pin physical cards with
-# ZE_AFFINITY_MASK (XPU) or CUDA_VISIBLE_DEVICES.
-#
-# `text_encoder_tp_size` must be either 1 (replicated Hugging Face UMT5, the
-# default everywhere else) or equal to `tensor_parallel_size`. Matching it puts
-# the UMT5-XXL encoder on the DiT's own TP group, so its ~10.6 GiB of weights
-# shard with the DiT instead of being replicated on every rank. The image
-# encoder and the Wan VAE stay replicated (~1.4 GiB combined).
+# DreamZero-DROID: TP=4 denoise and text encoder, CFG parallel disabled.
+# Topology: vllm_omni/model_executor/models/dreamzero/pipeline.py.
+# Devices are logical indices; select physical cards with ZE_AFFINITY_MASK
+# (XPU) or CUDA_VISIBLE_DEVICES.
+# text_encoder_tp_size must be 1 (replicated UMT5) or tensor_parallel_size
+# (shared DiT TP group). CLIP and Wan VAE remain replicated.
 
 pipeline: dreamzero
 async_chunk: false

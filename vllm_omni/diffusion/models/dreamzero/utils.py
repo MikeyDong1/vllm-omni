@@ -3,21 +3,13 @@
 
 """DreamZero model constants shared by the pipeline."""
 
-# --- Disaggregation wire contract -------------------------------------------
-# The single transport key DreamZero uses on every disaggregated stage edge.
-# Both edges (encode -> denoise, denoise -> decode) carry one entry under this
-# key; the payload's own ``boundary`` field distinguishes the two. Keeping one
-# transport key means a deploy config wires connectors per edge without the
-# model having to know which transport is in use.
+# Both stage edges share one transport key; payload.boundary identifies the edge.
 DREAMZERO_STAGE_PAYLOAD_KEY = "dreamzero_stage_payload"
 
-# Payload boundaries, i.e. which stage edge a payload was produced for.
 DREAMZERO_BOUNDARY_ENCODE_TO_DIT = "encode_to_dit"
 DREAMZERO_BOUNDARY_DIT_TO_DECODE = "dit_to_decode"
 
-# Wire-format version. Bump on any incompatible payload schema change; the
-# consuming stage rejects a payload it cannot interpret instead of silently
-# reading stale field names.
+# Bump on incompatible schema changes; consumers reject unknown versions.
 DREAMZERO_PAYLOAD_VERSION = 1
 
 DEFAULT_NUM_INFERENCE_STEPS = 16

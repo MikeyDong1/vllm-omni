@@ -119,23 +119,15 @@ class VideoActionScheduler:
         return ((video_out, action_out),)
 
 
-# ---------------------------------------------------------------------------
-# In-process phase results
-#
-# These are the *internal* handoff types between the encode, denoise and
-# postprocess phase helpers. They never reach a transport: crossing a stage edge
-# goes through ``DreamZeroStagePayload``, which degrades to a plain nested dict.
-# ---------------------------------------------------------------------------
+# Internal phase results stay in-process; stage edges use DreamZeroStagePayload.
 
 
 @dataclass
 class _DreamZeroSessionProgress:
-    """Per-session AR ordering bookkeeping, kept independently by each stage.
+    """Per-stage AR ordering: encode issues chunks, denoise records commits.
 
-    The encode stage owns *issue* order: it stamps every request it emits. The
-    denoise stage owns *committed* order: it advances only after the denoise loop
-    and the KV commit for that chunk have succeeded. A reset opens a new epoch,
-    which fences every request still in flight from the previous one.
+    Committed order advances only after denoise and KV commit succeed.
+    A session reset opens a new epoch, fencing older in-flight requests.
     """
 
     epoch: int = 0
@@ -152,11 +144,7 @@ class _DreamZeroAuthorization:
 
 @dataclass
 class _DreamZeroPostprocessMeta:
-    """Metadata the postprocess phase needs, produced by the encode phase.
-
-    The denoise stage forwards these untouched, which is why they travel in the
-    payload's ``private_*`` groups.
-    """
+    """Encode metadata passed unchanged through denoise to postprocess."""
 
     embodiment_name: str
     embodiment_key: str
@@ -219,11 +207,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     state: DreamZeroSessionState | None
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        """Describe DreamZero's local KV geometry to the generic runner.
-
-        Only the DiT-owning roles (FULL / DENOISE) reach this: AR-Diffusion KV
-        exists solely where the denoise loop runs.
-        """
+        """Describe local KV geometry for the DiT-owning FULL and DENOISE roles."""
         transformer = self.transformer
         if transformer is None:
             raise RuntimeError(
@@ -281,8 +265,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _drop_ar_diffusion_session_state(self, session_id: str) -> None:
         """Remove model state and clear the compatibility alias when it points there."""
         key = str(session_id or "default")
-        # The session's AR ordering dies with the session: a later session that
-        # reuses the id starts a fresh epoch rather than inheriting old progress.
+        # Discard ordering with the session so reused IDs do not inherit progress.
         for progress in (
             getattr(self, "_issued_progress", None),
             getattr(self, "_committed_progress", None),
@@ -348,14 +331,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             }
             prompt: Any
             if self._load_encoders:
-                # FULL role: the pipeline encodes the observation itself.
                 n_frames = 1 if index == 0 else 4
                 extra_args["robot_obs"] = self._ar_warmup_robot_obs(height, width, n_frames, session_id)
                 prompt = "warmup"
             else:
-                # DENOISE role: the observation is encoded on another worker, so
-                # warm up the real denoise path with a synthesized upstream
-                # payload instead of an observation the stage cannot consume.
+                # Denoise owns no encoders; warm it with a synthetic upstream payload.
                 prompt = {
                     "prompt": "warmup",
                     DREAMZERO_STAGE_PAYLOAD_KEY: self._warmup_encode_payload(
@@ -381,12 +361,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         height: int,
         width: int,
     ) -> DreamZeroStagePayload:
-        """Synthesize the encode payload a DENOISE-stage warmup forward needs.
+        """Build a synthetic upstream payload for DENOISE-stage warmup.
 
-        Shapes come from the checkpoint config and the deployed image resolution,
-        so warmup captures exactly the geometries a live rollout produces: the
-        window-start forward (a single reference latent frame) and the steady
-        -state forwards (a full ``num_frame_per_block`` observation window).
+        Use checkpoint and deployment geometry for both window-start and
+        steady-state observation shapes.
         """
         device = get_local_device()
         dtype = torch.bfloat16
@@ -418,12 +396,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             boundary=DREAMZERO_BOUNDARY_ENCODE_TO_DIT,
             scalar_fields={
                 "session_id": session_id,
-                # The runner already released the session for index 0, so no
-                # further reset is required here.
+                # The runner already released this session at index 0.
                 "reset_reason": None,
                 "window_start": window_start,
                 "current_start_frame": 0 if window_start else 1 + (index - 1) * nfpb,
-                # Warmup issues one clean epoch of consecutive chunks.
                 "epoch": 1,
                 "sequence": index + 1,
                 "attempt": 0,
@@ -520,15 +496,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
 
     def _reset_kv_session(self, *, keep_text_cross_attention: bool) -> None:
-        """Reset only the bound engine KV pool; the model's session state is untouched.
+        """Reset bound engine KV without changing model-owned state.
 
-        ``keep_text_cross_attention=True`` marks a window ("inference") reset: the
-        prompt is unchanged, so the pool keeps the text cross-attn K/V and only the
-        image half repopulates on the restart forward.
-
-        ``keep_text_cross_attention=False`` is a full session release -- the pool
-        closes and drops every named cross-attention allocation -- so the caller
-        must be on a window-start forward, the only one that repopulates them.
+        Window reset retains text cross-attention when requested. Full release
+        drops all cross-attention allocations and requires a window-start
+        forward to repopulate them.
         """
         kv_state = self._ar_diffusion_kv_state
         if kv_state is None:
@@ -539,19 +511,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         kv_state.reset(keep_cross_attention=("text",) if keep_text_cross_attention else ())
 
     def _kv_reset(self, state, *, clear_video_latents: bool = True):
-        """Reset the engine's pooled session window plus the model's non-KV state.
+        """Reset the consuming denoise stage's KV and model-owned window state.
 
-        DreamZero resets at the attention-window boundary; the engine pool drops the
-        same window so the next forward starts fresh. ``clear_video_latents=False``
-        keeps the accumulated video latents for export.
-
-        For the stage that owns both halves of a reset for its own session state
-        (the consuming denoise role). The full role resets model state in
-        ``_encode_phase`` and calls ``_reset_kv_session`` directly, so it must not
-        come through here -- that would erase the encode it just produced.
-
-        The KV half runs first so an unbound pool raises before anything is
-        mutated, rather than leaving the model state half-reset.
+        Reset KV first so an unbound pool fails before model state is changed.
+        FULL uses _reset_kv_session instead: its encode phase already rebuilt
+        model state. clear_video_latents=False preserves latents for export.
         """
         self._reset_kv_session(keep_text_cross_attention=not clear_video_latents)
         state.reset(clear_video_latents=clear_video_latents)
@@ -578,25 +542,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """
         super().__init__()
 
-        # ---- Stage role -------------------------------------------------
-        # ``resolve_diffusion_stage_role`` maps the structured ``stage_role``
-        # (falling back to the legacy free-form ``model_stage``) onto the shared
-        # ``DiffusionStageRole`` vocabulary. Monolithic deployments resolve to
-        # FULL and behave exactly as before.
-        #
-        # ``role_loads_component`` then decides which component groups this
-        # stage constructs. DreamZero reads the generic groups as:
-        #   "encoder" -> tokenizer + UMT5 + CLIP image encoder + VAE *encode*
-        #                path (the VAE module is an input encoder here, not an
-        #                output decoder)
-        #   "dit"     -> CausalWan DiT, denoise schedulers, action modules and
-        #                the AR-Diffusion paged KV geometry
-        #   "vae"     -> a VAE *decoder* for producing RGB output, which
-        #                DreamZero's trailing stage does not use: it emits
-        #                normalized video latents plus actions, so the decode
-        #                stage deliberately loads no VAE at all.
-        # Components are pruned before construction, not merely skipped at call
-        # time, so a disaggregated worker never pays their memory cost.
+        # Prune components before construction according to the stage role.
+        # DreamZero's VAE belongs to the encoder group; trailing postprocess
+        # emits latents/actions and needs no VAE decoder.
         self.stage_role = resolve_diffusion_stage_role(
             getattr(od_config, "stage_role", None),
             getattr(od_config, "model_stage", None),
@@ -604,18 +552,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         role = self.stage_role.value
         self._load_encoders = role_loads_component(role, "encoder")
         self._load_dit = role_loads_component(role, "dit")
-        # The VAE lives with the encode path (observation encoding); the decode
-        # stage needs neither the module nor its weights.
         self._load_vae = self._load_encoders
-        # Frame history, the VAE encoder stream, prompt-embed caches and AR
-        # progress are all per-session. The trailing decode stage is stateless.
         self._holds_session_state = self._load_encoders or self._load_dit
 
-        # Only the DiT-owning roles touch AR-Diffusion KV, and only they need the
-        # AR-Diffusion engine. Fail fast there — a stale or programmatic config
-        # that leaves engine_backend="default" would otherwise only crash
-        # mid-forward on the first KV access. Encode/decode stages run on the
-        # plain diffusion engine and must not require the AR backend.
+        # Only DiT-owning roles require the AR backend. Reject invalid placement
+        # at initialization, before the first paged-KV access.
         engine_backend = str(getattr(od_config, "engine_backend", "") or "")
         if self._load_dit and "ar_diffusion" not in engine_backend.lower().replace("-", "_"):
             raise ValueError(
@@ -642,7 +583,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         ah_config = action_head_cfg["config"]
         diffusion_model_cfg = ah_config["diffusion_model_cfg"]
 
-        # ---- Tokenizer + text/image encoders (encode-side components) ----
+        # Encode-side components.
         if self._load_encoders:
             tokenizer_source = od_config.model_paths.get("tokenizer", "google/umt5-xxl")
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
@@ -702,9 +643,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             self.vae = None
 
-        # ---- CausalWan DiT + denoise schedulers (denoise-side components) ----
+        # Denoise-side components.
         if self._load_dit:
-            # Filter out keys not accepted by `CausalWanModel.__init__`.
             transformer_kwargs = {k: v for k, v in diffusion_model_cfg.items() if k not in ("_convert_", "_target_")}
             transformer_kwargs["action_dim"] = ah_config["action_dim"]
             transformer_kwargs["max_state_dim"] = ah_config["max_state_dim"]
@@ -724,20 +664,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # state bounds its VAE encoder history to this many latent frames.
         self.num_frame_per_block: int = ah_config["num_frame_per_block"]
         self.action_dim: int = ah_config["action_dim"]
-        # Text conditioning geometry, read from the checkpoint config so a stage
-        # without a DiT can still describe the prompt-embedding shape.
+        # Checkpoint geometry is also needed by stages without a DiT.
         self.text_len: int = int(diffusion_model_cfg.get("text_len", 512))
         self.text_dim: int = int(diffusion_model_cfg.get("text_dim", 4096))
-        # Attention-window size, derived exactly as ``CausalWanModel`` does. The
-        # encode stage needs it to decide when the session's window rolls over
-        # without owning the DiT; the DiT stage keeps reading it off the module.
+        # Encode needs the DiT's window size to detect rollover without loading it.
         max_chunk_size = int(diffusion_model_cfg.get("max_chunk_size", -1))
         self.local_attn_size: int = max_chunk_size * self.num_frame_per_block + 1 if max_chunk_size != -1 else -1
 
-        # AR ordering bookkeeping. Each stage keeps only the half it owns: the
-        # encode stage stamps issue order, the denoise stage records committed
-        # progress. They are separate dicts so a single-process FULL deployment
-        # exercises the same authorization path as the split one.
+        # Keep issue and commit ledgers separate even in FULL mode; see _DreamZeroSessionProgress.
         self._issued_progress: dict[str, _DreamZeroSessionProgress] = {}
         self._committed_progress: dict[str, _DreamZeroSessionProgress] = {}
 
@@ -753,8 +687,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         if self._use_memory_manager:
             logger.info("DreamZero: session state manager enabled (max_sessions=%d)", mm_max_sessions)
-        # The decode stage is stateless postprocess: no frame history, no VAE
-        # encoder stream, no KV. Every other role keeps stage-local session state.
+        # Postprocess is stateless; other roles retain stage-local history.
         self.state = self._get_or_create_state("default") if self._holds_session_state else None
 
         # DiT step cache is configured by StepCacheBackend
@@ -808,9 +741,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # Number of action dims that are relative (DROID: 7 = joint only, gripper is absolute)
         self.relative_action_dim: int = model_config.get("relative_action_dim", 7)
 
-        # A decode-only stage builds no torch modules, so it must not pull the
-        # root safetensors shards at all -- reading a 14B checkpoint to load
-        # nothing is exactly the cost disaggregation is meant to avoid.
+        # The weightless postprocess stage must skip checkpoint downloads.
         self._weights_sources = (
             [
                 DiffusersPipelineLoader.ComponentSource(
@@ -949,7 +880,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         apply_wan_vae_feat_cache_tensor_patch()
 
         compile_ro = {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
-        # Each stage compiles only the components it constructed.
         compile_encoders = self._load_encoders
         compile_dit = self._load_dit
         # DiT blocks: default avoids CUDAGraph overwrite on modulation tensors; encoders use reduce-overhead.
@@ -1007,7 +937,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if not torch.cuda.is_available():
             return
         if not self._load_encoders:
-            # Nothing warmed up here is owned by a denoise- or decode-only stage.
+            # Only encoder-owning stages can run this warmup.
             return
 
         state = self.state
@@ -1646,9 +1576,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         return noisy_input, noisy_input_action
 
-    # -----------------------------------------------------------------------
-    # Stage dispatch and shared phase helpers
-    # -----------------------------------------------------------------------
+    # Stage dispatch and shared phase helpers.
 
     def _transform_robot_obs(self, robot_obs: dict):
         """Select DreamZero robot transform and convert raw obs to model input."""
@@ -1657,14 +1585,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return transform, transform.transform_input(robot_obs)
 
     def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
-        """Dispatch to the computation this pipeline's stage role owns.
-
-        Role dispatch is all this does; every bit of model math stays in the
-        shared phase helpers below, which the monolithic ``forward`` and the
-        three disaggregated stages call in the same order. The runner therefore
-        needs no knowledge of DreamZero, and a monolithic and a disaggregated
-        deployment run the same code.
-        """
+        """Dispatch by stage role to the phase helpers shared with monolithic inference."""
         if self.stage_role is DiffusionStageRole.ENCODE:
             return self.encode_batch(batch)
         if self.stage_role is DiffusionStageRole.DENOISE:
@@ -1675,21 +1596,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
-        """Full monolithic inference step (FULL role).
-
-        Identical to the pre-disaggregation behaviour, expressed as the three
-        phases the split stages run individually.
-        """
+        """Run encode, denoise and postprocess in one worker for the FULL role."""
         encoded = self._encode_phase(req)
         if isinstance(encoded, DiffusionOutput):
-            # Dummy warmup request with no observation: nothing to denoise.
             return encoded
 
-        # A full KV release drops every cross-attention allocation, and only a
-        # window-start forward repopulates it (see ``_denoise_phase``). Both reset
-        # reasons zero ``current_start_frame`` before ``window_start`` is derived
-        # from it, so the two always agree; fail loudly if they ever stop agreeing,
-        # and do it before ``_authorize_stage_progress`` advances any progress.
+        # A full KV release requires a window-start forward to repopulate cross-attention.
+        # Check before authorization advances progress.
         if encoded.reset_reason == "session" and not encoded.window_start:
             raise RuntimeError(
                 f"DreamZero session {encoded.session_id!r} opens a new session at window frame "
@@ -1699,22 +1612,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         state = self._get_or_create_state(encoded.session_id)
         authorization = self._authorize_stage_progress(encoded, state)
-        # The model-owned half of the reset already ran in ``_encode_phase`` -- that
-        # decision needs the tokenized prompt -- and this encode then rebuilt the
-        # state, so only the KV half is left to apply. Resetting the state again
-        # here would drop the language, prompt-embed cache, VAE stream and frame
-        # buffer that were just produced, which makes the next request look like a
-        # brand new session. ``authorization.new_epoch`` already implies a
-        # ``"session"`` reason in this role, since both progress counters belong to
-        # this process and move together; the disjunction keeps the two honest.
+        # Encode already reset and rebuilt model state. Reset only KV here,
+        # or the conditioning and history just produced would be discarded.
         new_session = authorization.new_epoch or encoded.reset_reason == "session"
         if new_session or encoded.reset_reason == "inference":
             self._reset_kv_session(keep_text_cross_attention=not new_session)
         denoised = self._denoise_phase(encoded, state=state)
         self._commit_stage_progress(encoded)
         return self._postprocess_phase(encoded.postprocess_meta, denoised)
-
-    # -- Stage 0: encode ------------------------------------------------------
 
     def encode_batch(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
         """ENCODE stage: run the encoders and emit the encode -> denoise payload."""
@@ -1723,9 +1628,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return encoded
 
         payload = self._pack_encode_payload(batch, encoded)
-        # Advance the issue-side window mirror only after the payload is built.
-        # The denoise stage remains the committed-progress authority; this mirror
-        # exists so the encode stage knows which observation branch to run next.
+        # Advance the encode-side mirror after payload construction; denoise
+        # remains authoritative for committed progress.
         state = self._get_or_create_state(encoded.session_id)
         state.current_start_frame = (
             1 + self.num_frame_per_block
@@ -1735,11 +1639,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return DiffusionOutput(output=None, custom_output=payload.as_custom_output(), to_cpu=True)
 
     def _encode_phase(self, req: DiffusionRequestBatch) -> _DreamZeroEncoded | DiffusionOutput:
-        """Tokenize, encode text/image/observation, and prepare latents + noise.
-
-        Returns a ``DiffusionOutput`` instead when the request is the engine's
-        observation-free warmup probe, which has nothing to encode.
-        """
+        """Encode conditioning and prepare latents/noise; return an empty output for warmup."""
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
         if robot_obs is None:
@@ -1805,27 +1705,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         text_tokens = text_inputs["input_ids"].to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
 
-        # An explicit request reset clears this stage's own model state. The plain
-        # encode stage has no AR runner to do that for it, and the full role must
-        # not depend on the runner having released the session first. Model-detected
-        # prompt/window resets are decided here too, because they depend on the
-        # tokenized DreamZero state. Only the model-owned half of the reset runs in
-        # this phase: the KV half belongs to whichever stage owns the AR-Diffusion
-        # pool, and nothing between here and that reset touches KV.
+        # Reset model-owned state here, including on stages without an AR runner.
+        # Prompt/window decisions need tokenized state; KV reset remains with
+        # the denoise owner and must happen before any KV access.
         reset_reason = "session" if explicit_reset else state.reset_reason(text_tokens, 0, self.local_attn_size)
         if reset_reason == "session":
             if explicit_reset:
-                # ``reset_reason()`` logs its own verdicts; this branch skips it.
                 logger.info("explicit request reset for session=%s, resetting", session_id)
             state.reset(clear_video_latents=True)
         elif reset_reason == "inference":
             state.reset(clear_video_latents=False)
         state.language = text_tokens
 
-        # Stamp issue order. A session reset -- explicit from the request or
-        # detected from a prompt change -- opens a new epoch, which fences every
-        # request still in flight from the previous one. A window ("inference")
-        # reset continues the same session and keeps the epoch.
+        # A session reset opens an epoch and fences in-flight requests.
+        # Window resets retain the epoch.
         epoch, sequence, attempt = self._next_issue_progress(
             session_id,
             new_epoch=reset_reason == "session",
@@ -1947,14 +1840,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             phase_timing=_pt,
         )
 
-    # -- Stage 1: denoise -----------------------------------------------------
-
     def denoise_batch(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
-        """DENOISE stage: consume the encode payload, run the sharded DiT, emit latents.
+        """Consume encode payload and run the sharded DiT on every TP rank.
 
-        Every TP rank enters the ordinary sharded DiT forward with the same
-        payload; the payload broadcast is the runner's, and the DiT's own
-        tensor-parallel collectives are untouched by disaggregation.
+        The runner broadcasts the shared payload; DiT collectives remain local
+        to its TP group.
         """
         dummy = self._dummy_warmup_output(batch)
         if dummy is not None:
@@ -1976,8 +1866,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             self._apply_kv_reset(state, encoded.reset_reason)
         denoised = self._denoise_phase(encoded, state=state)
-        # Progress advances only now: a failed denoise or KV commit raises above
-        # and leaves committed progress untouched.
         self._commit_stage_progress(encoded)
         out_payload = self._pack_denoise_payload(payload, denoised)
         return DiffusionOutput(output=None, custom_output=out_payload.as_custom_output(), to_cpu=True)
@@ -1993,16 +1881,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         _pt = enc.phase_timing
         _pt_mark = self._phase_timing_marker(_pt)
 
-        # The denoise stage owns the conditioning the DiT reads off session state.
         state.clip_feas = enc.clip_feas
         state.ys = enc.ys
 
         if enc.window_start:
-            # Eager cross-attn population (AR-Diffusion only): cache text +
-            # image-token K/V into the pool now that the image is encoded
-            # (clip_feas available). Runs on the first forward of a session and
-            # after each window-boundary reset; the populate guards (text/img
-            # halves) gate re-entry.
+            # Populate cross-attention at window start; per-half guards preserve
+            # text KV when only image conditioning needs refresh.
             self._kv_populate_cross(enc.prompt_embeds, state.clip_feas, is_negative=False)
             if enc.negative_prompt_embeds is not None:
                 self._kv_populate_cross(enc.negative_prompt_embeds, state.clip_feas, is_negative=True)
@@ -2063,15 +1947,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         if state.current_start_frame == 1:
             video_out = torch.cat([image, video_out], dim=1)
-        # Committed progress: only advanced once the denoise loop has produced
-        # this chunk, and only on the stage that owns the KV it belongs to.
         state.current_start_frame += self.num_frame_per_block
 
         state.append_video_latents(video_out)
 
         return _DreamZeroDenoised(video_latents=video_out, actions=action_out)
-
-    # -- Stage 2: decode / postprocess ---------------------------------------
 
     def decode_batch(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
         """DECODE stage: turn denoise output plus metadata into the response."""
@@ -2080,10 +1960,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return dummy
         payload = self._unpack_stage_payload(batch, DREAMZERO_BOUNDARY_DIT_TO_DECODE)
         private = payload.private_scalar_fields
-        # Both of these silently change the numbers if they go missing -- an
-        # absent embodiment skips q99 denormalization, and an absent observation
-        # state leaves relative joint targets relative -- so require them
-        # explicitly rather than defaulting.
+        # Missing embodiment or observation state would silently change action
+        # denormalization or absolute joint targets; require both fields.
         embodiment_name = private.get("embodiment_name")
         if not embodiment_name:
             raise DreamZeroPayloadError(
@@ -2143,8 +2021,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             },
         )
 
-    # -- Payload pack / unpack ------------------------------------------------
-
     def _unpack_stage_payload(
         self,
         batch: DiffusionRequestBatch,
@@ -2161,12 +2037,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         batch: DiffusionRequestBatch,
         enc: _DreamZeroEncoded,
     ) -> DreamZeroStagePayload:
-        """Build the encode -> denoise payload.
+        """Build the encode-to-denoise payload with current prompt embeddings.
 
-        Prompt embeddings ride along on every tick rather than being cached on
-        the denoise side: they are a few MB next to a 14B DiT forward, and a
-        stateless edge means a restarted denoise worker cannot silently denoise
-        against a stale prompt.
+        Carry embeddings on each tick so restarted consumers cannot reuse
+        a stale cached prompt.
         """
         tensor_fields: dict[str, torch.Tensor] = {
             "prompt_embeds": enc.prompt_embeds,
@@ -2194,8 +2068,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 "reset_reason": enc.reset_reason,
                 "window_start": bool(enc.window_start),
                 "current_start_frame": int(enc.current_start_frame),
-                # Issue-order metadata the denoise stage authorizes against its
-                # own committed progress before touching the model or the KV pool.
                 "epoch": int(enc.epoch),
                 "sequence": int(enc.sequence),
                 "attempt": int(enc.attempt),
@@ -2204,12 +2076,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 "do_true_cfg": bool(enc.do_true_cfg),
             },
             tensor_fields=tensor_fields,
-            # Postprocess metadata the denoise stage forwards without reading.
             private_scalar_fields={
                 "embodiment_name": enc.postprocess_meta.embodiment_name,
                 "embodiment_key": enc.postprocess_meta.embodiment_key,
-                # Explicit so the decode stage can tell "this request had no
-                # observation state" apart from "the state was lost in transit".
+                # Distinguish an explicitly absent observation from a lost payload field.
                 "has_observation_state": enc.postprocess_meta.last_state is not None,
             },
             private_tensor_fields=private_tensor_fields,
@@ -2262,12 +2132,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 "video_latents": denoised.video_latents,
                 "actions": denoised.actions,
             },
-            # Opaque to this stage; the decode stage consumes them.
             private_scalar_fields=dict(incoming.private_scalar_fields),
             private_tensor_fields=dict(incoming.private_tensor_fields),
         )
-
-    # -- Shared helpers -------------------------------------------------------
 
     def _next_issue_progress(self, session_id: str, *, new_epoch: bool) -> tuple[int, int, int]:
         """Stamp and return the issue-order metadata for one outgoing request."""
@@ -2276,8 +2143,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             progress.epoch += 1
             progress.sequence = 0
         progress.sequence += 1
-        # DreamZero has no request-level retry today; the field is carried so a
-        # retry can be distinguished from a duplicate without a schema change.
+        # Carry retry identity in the schema; request-level retries are not supported yet.
         progress.attempt = 0
         return progress.epoch, progress.sequence, progress.attempt
 
@@ -2286,11 +2152,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         enc: _DreamZeroEncoded,
         state: DreamZeroSessionState,
     ) -> _DreamZeroAuthorization:
-        """Authorize an incoming chunk against committed progress.
+        """Validate chunk ordering before KV reset or model/KV mutation.
 
-        Runs before the KV reset and before any model or KV mutation, so a
-        stale, duplicated, out-of-order or fenced request is refused rather than
-        half-applied to a live AR-Diffusion session.
+        Reject stale, duplicate, out-of-order and fenced requests before
+        they can be partially applied.
         """
         committed = self._committed_progress.setdefault(enc.session_id, _DreamZeroSessionProgress())
 
@@ -2321,8 +2186,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 f"committed chunk {committed.sequence}; AR-Diffusion KV cannot skip a chunk."
             )
 
-        # A reset (of either kind) defines the new window position, so only a
-        # continuing chunk has to agree with the committed one.
+        # Resets define a new window position; only continuations must match the old one.
         if not new_epoch and enc.reset_reason is None:
             local_start_frame = int(state.current_start_frame)
             if enc.current_start_frame != local_start_frame:
@@ -2342,24 +2206,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         committed.attempt = enc.attempt
 
     def _fence_session_epoch(self, state: DreamZeroSessionState) -> None:
-        """Drop the previous epoch's window before the first chunk of a new one.
-
-        Consuming-stage helper: it resets this stage's own session state as well as
-        its KV. The AR runner already releases the session when a request carries
-        ``reset``, but the epoch stamp makes this stage self-sufficient: it
-        fences the old window even if it never saw that flag.
-        """
+        """Fence old window state at a new epoch, even if this stage missed reset."""
         self._kv_reset(state, clear_video_latents=True)
 
     def _apply_kv_reset(self, state: DreamZeroSessionState, reset_reason: str | None) -> None:
-        """Apply a reset on the consuming stage that owns both halves for itself.
-
-        In a split deployment this stage's session state is a different object in a
-        different process from the encode stage's, so it resets its own copy here;
-        the encode stage did its own in ``_encode_phase``. The full role does not
-        come through here -- ``_encode_phase`` ran in the same process, so it resets
-        KV only.
-        """
+        """Reset the consuming stage's own state and KV; see _kv_reset."""
         if reset_reason is None:
             return
         self._kv_reset(state, clear_video_latents=reset_reason == "session")
@@ -2382,11 +2233,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     @staticmethod
     def _phase_timing_probe():
-        """Start optional per-phase timing (DZ_PHASE_TIMING=1).
-
-        Each mark synchronizes the accelerator, so leave it off for timed
-        benchmark runs.
-        """
+        """Start optional phase timing; synchronization makes it unsuitable for benchmarks."""
         if not os.environ.get("DZ_PHASE_TIMING"):
             return None, lambda name: None
 

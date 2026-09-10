@@ -1,31 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DreamZero diffusion pipeline topologies (frozen).
+"""DreamZero single-stage and opt-in disaggregated topologies.
 
-DreamZero runs as a single-stage diffusion model by default: the encoders, the
-CausalWan DiT denoise loop and the action postprocess all live on one worker
-(``DREAMZERO_PIPELINE``, selected by ``pipeline: dreamzero``). Nothing about
-that default changes here.
+Stage 0 owns tokenizer, UMT5, CLIP and observation VAE encoding. Stage 1
+owns CausalWan DiT and paged KV. Stage 2 is weightless action postprocess.
 
-``DREAMZERO_DISAGGREGATED_PIPELINE`` is the explicit opt-in three-stage variant:
-
-    Request
-      -> Stage 0: Encode      (tokenizer + UMT5 + CLIP + VAE encode)
-      -> Stage 1: Denoise      (CausalWan DiT + AR-Diffusion paged KV, TP=4)
-      -> Stage 2: Decode        (action postprocess -> response)
-      -> Response
-
-The stages are wired model-agnostically through ``DiffusionStageRole`` and the
-generic cross-stage handoff
-``vllm_omni.model_executor.stage_input_processors.diffusion_disagg.diffusion_stage_handoff``,
-so DreamZero contributes only its role split and its payload schema -- never a
-transport choice. Both edges declare the same single payload key; the payload's
-``boundary`` field carries the semantic difference.
-
-Runtime knobs (device placement, Stage-1 tensor parallelism, AR-Diffusion
-backend, connector wiring) live in ``vllm_omni/deploy/dreamzero_disaggregated.yaml``;
-select it with ``--deploy-config``. Switching to a different transport is a
-deploy-config edit and touches no DreamZero source.
+Stage roles and payload edges are defined here. Device placement, TP size
+and connector selection live in deploy/dreamzero_disaggregated.yaml.
 """
 
 from vllm_omni.config.stage_config import (
@@ -39,12 +20,9 @@ from vllm_omni.diffusion.models.dreamzero.utils import DREAMZERO_STAGE_PAYLOAD_K
 _DREAMZERO_MODEL_ARCH = "DreamZeroPipeline"
 _DIFFUSION_HANDOFF = "vllm_omni.model_executor.stage_input_processors.diffusion_disagg.diffusion_stage_handoff"
 
-# One transport key for both stage edges; ``boundary`` inside the payload tells
-# encode->denoise apart from denoise->decode.
 _DREAMZERO_PAYLOAD_KEYS = (DREAMZERO_STAGE_PAYLOAD_KEY,)
 
 
-# --- Single-stage (default) --------------------------------------------------
 DREAMZERO_PIPELINE = PipelineConfig(
     model_type="dreamzero",
     default_deploy_config_name="dreamzero.yaml",
@@ -64,7 +42,6 @@ DREAMZERO_PIPELINE = PipelineConfig(
 )
 
 
-# --- Encode / Denoise / Decode disaggregation (opt-in) ----------------------
 DREAMZERO_DISAGGREGATED_PIPELINE = PipelineConfig(
     model_type="dreamzero_disaggregated",
     default_deploy_config_name="dreamzero_disaggregated.yaml",
@@ -79,8 +56,7 @@ DREAMZERO_DISAGGREGATED_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=False,
             model_arch=_DREAMZERO_MODEL_ARCH,
-            # Surface the encode payload on custom_output so the connector (or,
-            # on fallback, the orchestrator) forwards it downstream.
+            # Forward the non-final stage payload through custom_output.
             engine_output_type="custom",
         ),
         StagePipelineConfig(

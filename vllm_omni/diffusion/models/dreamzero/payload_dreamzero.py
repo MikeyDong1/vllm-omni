@@ -1,31 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""DreamZero cross-stage payload schema.
+"""DreamZero cross-stage payloads: plain nested dictionaries and tensors.
 
-DreamZero keeps a typed payload internally and degrades it to a plain nested
-dict at the wire boundary. That dict is all a transport ever sees: no dataclass
-identity, no scheduler, generator, module, device handle, live request state, KV
-state or callable survives ``to_dict()``. A stage therefore cannot accidentally
-depend on the producer's Python objects, and the same payload travels unchanged
-over shared memory today and over any other transport later.
-
-Layout::
-
-    {
-        "request_id": request_id,
-        "boundary": "encode_to_dit" | "dit_to_decode",
-        "payload_version": 1,
-        "scalar_fields": {...},          # consumed by the receiving stage
-        "tensor_fields": {...},
-        "private_scalar_fields": {...},  # opaque passthrough for a later stage
-        "private_tensor_fields": {...},
-    }
-
-The ``private_*`` groups exist so a middle stage can forward postprocess
-metadata it does not itself consume (DreamZero's decode stage needs the
-observation state and embodiment produced by encode) without the middle stage
-having to know those field names.
+The envelope identifies request, boundary and schema version. Scalar/tensor
+fields are consumed by the next stage; private fields pass through to later
+postprocess. Live model, scheduler, generator and session objects stay local.
 """
 
 from __future__ import annotations
@@ -50,9 +30,7 @@ _KNOWN_BOUNDARIES = frozenset(
     }
 )
 
-# Scalar types allowed on the wire. Anything else (module, scheduler, generator,
-# callable, device, session object) is rejected by ``validate()`` rather than
-# silently pickled into a transport buffer.
+# Allowed wire scalars; validate() rejects opaque runtime objects.
 _ALLOWED_SCALARS = (bool, int, float, str, bytes, type(None))
 
 _MISSING = object()
@@ -63,11 +41,7 @@ class DreamZeroPayloadError(ValueError):
 
 
 class DreamZeroStaleRequestError(ValueError):
-    """A payload is stale, duplicated, out of order, or from a fenced epoch.
-
-    Raised by the committed-progress authority *before* any model or KV mutation,
-    so a rejected request cannot corrupt a live AR-Diffusion session.
-    """
+    """Stale or out-of-order payload rejected before model or KV mutation."""
 
 
 def _reject_opaque(where: str, name: str, value: object) -> None:
@@ -127,10 +101,8 @@ class DreamZeroStagePayload:
     private_scalar_fields: dict[str, Any] = field(default_factory=dict)
     private_tensor_fields: dict[str, torch.Tensor] = field(default_factory=dict)
 
-    # -- wire format ----------------------------------------------------------
-
     def to_dict(self) -> dict[str, Any]:
-        """Degrade to the plain nested dict a transport is allowed to see."""
+        """Serialize the payload to its plain wire dictionary."""
         self.validate()
         return {
             "request_id": self.request_id,
@@ -148,8 +120,7 @@ class DreamZeroStagePayload:
         if raw is None:
             raise DreamZeroPayloadError("DreamZero stage payload is missing.")
         if isinstance(raw, DreamZeroStagePayload):
-            # Monolithic / same-process execution never leaves Python; accept the
-            # typed object so callers share one code path with the wire case.
+            # Accept typed payloads for same-process handoffs.
             raw.validate()
             return raw
         if not isinstance(raw, dict):
@@ -166,20 +137,13 @@ class DreamZeroStagePayload:
         payload.validate()
         return payload
 
-    # -- validation -----------------------------------------------------------
-
     def validate(
         self,
         *,
         request_id: str | None = None,
         boundary: str | None = None,
     ) -> None:
-        """Check the envelope and the field groups.
-
-        ``request_id`` / ``boundary`` let a consumer assert that the payload it
-        received belongs to the request it is executing and was produced for the
-        edge it sits on. Both checks run before any model or KV mutation.
-        """
+        """Validate field groups and request/boundary identity before model or KV mutation."""
         if not self.request_id:
             raise DreamZeroPayloadError("DreamZero stage payload has no request_id.")
         if self.boundary not in _KNOWN_BOUNDARIES:
@@ -216,8 +180,6 @@ class DreamZeroStagePayload:
                 f"DreamZero stage payload has boundary {self.boundary!r} but this stage consumes {boundary!r}."
             )
 
-    # -- accessors ------------------------------------------------------------
-
     def scalar(self, name: str, default: Any = _MISSING) -> Any:
         if name in self.scalar_fields:
             return self.scalar_fields[name]
@@ -233,11 +195,7 @@ class DreamZeroStagePayload:
         return default
 
     def to_device(self, device: torch.device | str | None) -> DreamZeroStagePayload:
-        """Return a copy with every tensor field on ``device``.
-
-        Payload tensors cross a process boundary on CPU; the consuming stage
-        pulls them onto its *own* current device rather than the producer's.
-        """
+        """Copy tensor fields to the consuming stage's own device."""
         self.tensor_fields = {name: _move(value, device) for name, value in self.tensor_fields.items()}
         self.private_tensor_fields = {name: _move(value, device) for name, value in self.private_tensor_fields.items()}
         return self
@@ -248,13 +206,7 @@ class DreamZeroStagePayload:
 
 
 def get_incoming_stage_payload(prompt: object) -> DreamZeroStagePayload:
-    """Read the upstream payload out of a consuming stage's prompt.
-
-    The connector receive path writes into ``prompt["additional_information"]``;
-    the orchestrator's inline fallback lands the same entry at the top level of
-    the prompt dict. Look in both, in that order, so a stage behaves identically
-    whether the payload arrived worker-to-worker or through the IPC hop.
-    """
+    """Read additional_information first, then the legacy top-level payload."""
     if not isinstance(prompt, dict):
         raise DreamZeroPayloadError(
             f"DreamZero stage prompt must be a dict carrying {DREAMZERO_STAGE_PAYLOAD_KEY!r}, "

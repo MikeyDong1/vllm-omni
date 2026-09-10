@@ -1,36 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Generic cross-stage handoff for disaggregated diffusion pipelines.
+"""Route diffusion stage outputs without owning transport or session state.
 
-A producing diffusion stage (e.g. an ``encode`` stage running only the
-encoders, or a ``denoise`` stage emitting latents) surfaces its payload on
-``DiffusionOutput.custom_output`` (exposed on the stage request output as
-``_custom_output``). This processor threads that payload -- plus the connector
-transfer handle, if any -- into the consuming stage's prompt dict so the
-downstream stage skips the work the upstream stage already did.
-
-This processor is model-agnostic: it forwards *whatever* keys the upstream stage
-published on ``custom_output`` (prompt embeddings, latents, conditioning
-tensors, opaque model payload dicts, ...) together with the diffusion
-sampling/control fields, so any DiT model can be disaggregated by declaring
-stage roles in config rather than writing a bespoke processor.
-
-It is also transport-neutral and stateless. It never selects a connector, never
-calls ``put``/``get``, and owns no TP broadcast, KV or session lifecycle. It only
-routes, and it handles all three states the send path can leave behind:
-
-1. **inline** -- the payload keys are still on ``custom_output`` (no connector
-   edge configured), so they are carried inline to the next stage;
-2. **connector** -- the send succeeded, so the payload keys are gone and only the
-   transfer handle is forwarded;
-3. **send failed** -- no handle was produced and the inline payload is untouched,
-   so this degrades to case 1.
-
-Payload entries land in ``prompt["additional_information"]``, which is exactly
-where the worker-side connector receive path writes them. A pipeline therefore
-reads the same location under either transport and needs no transport branch.
-The transfer handle goes to the top level of the prompt instead, because that is
-where the runner pops it from.
+Inline custom_output payloads merge into additional_information, matching
+connector reception. Transfer handles stay at the prompt top level for the
+runner. A failed send retains inline data and follows the same route.
 """
 
 from __future__ import annotations
@@ -56,22 +30,12 @@ _PASSTHROUGH_KEYS: tuple[str, ...] = (
     "modalities",
 )
 
-# Suffix marking connector transfer-handle entries on ``custom_output``. The
-# canonical handle key is owned by the generic runner (see
-# ``_stage_payload_handle_key``); this suffix additionally catches any further
-# per-edge handles a producer may publish, without this module having to know
-# their names.
+# Recognize per-edge transfer handles in addition to the runner's canonical key.
 _TRANSFER_HANDLE_SUFFIX = "_transfer"
 
 
 def _stage_payload_handle_key() -> str:
-    """Return the runner's stage-payload transfer handle key.
-
-    Read from the generic runner rather than restated here, so the producer, this
-    router and the consumer cannot drift apart. Imported lazily: this module is
-    loaded in the orchestrator process at stage-init time, which has no reason to
-    pull in the worker's import graph until a handoff actually happens.
-    """
+    """Load the runner's canonical handle key lazily to avoid worker imports at stage init."""
     try:
         from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
@@ -107,14 +71,10 @@ def diffusion_stage_handoff(
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[dict[str, Any]]:
-    """Build the next diffusion stage's prompt dicts from upstream outputs.
+    """Build downstream prompts through the orchestrator transition interface.
 
-    Accepts the orchestrator's transition interface
-    ``processor(source_outputs, prompt, requires_multimodal_data)``. Payload keys
-    published by the upstream stage go into
-    ``next_prompt["additional_information"]`` -- the same place the worker-side
-    connector receive path writes them -- while connector transfer handles go to
-    the top level of the prompt, where the runner pops them from.
+    Merge payloads into additional_information and place transfer handles
+    at the top level for the runner.
     """
     del requires_multimodal_data, streaming_context
 
@@ -131,15 +91,13 @@ def diffusion_stage_handoff(
         custom_output = _extract_custom_output(source_output)
 
         next_prompt: dict[str, Any] = {}
-        # Keep the raw text for logging/metadata; the downstream pipeline drops
-        # it when payload tensors (embeddings/latents) are present.
+        # Preserve text for logging; payload tensors supply downstream conditioning.
         if original_prompt.get("prompt") is not None:
             next_prompt["prompt"] = original_prompt["prompt"]
         for key in _PASSTHROUGH_KEYS:
             if original_prompt.get(key) is not None:
                 next_prompt[key] = original_prompt[key]
-        # Preserve anything the upstream prompt already carried here so the
-        # payload merge below adds to it rather than replacing it.
+        # Merge payload fields without replacing existing additional_information.
         additional: dict[str, Any] = dict(original_prompt.get("additional_information") or {})
 
         payload_keys: list[str] = []

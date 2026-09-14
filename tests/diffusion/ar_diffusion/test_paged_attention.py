@@ -64,7 +64,7 @@ def _dense_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 def _paged_attn_device() -> torch.device | None:
     """The accelerator whose paged FlashAttention this build can actually run.
 
-    ``ar_diffusion_paged_attention`` dispatches on ``device.type``, so the
+    The KV cache resolves its backend from the device it is built on, so the
     numerical test has to follow whichever accelerator is present. XPU is
     checked first because its kernel has no CUDA-style driver caveat: an
     importable varlen entry point plus a visible device is the whole
@@ -223,10 +223,15 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         query_len=query.shape[1],
         device=device,
     )
+    # A CPU cache resolves to the reference backend at construction time; the
+    # helper is handed that decision instead of re-deriving it from the tensors.
+    assert kv.attention_config.backend_id == paged_attention_module.BACKEND_REFERENCE
     paged = ar_diffusion_paged_attention(
         query,
         kv.key_cache(0),
         kv.value_cache(0),
+        backend_id=kv.attention_config.backend_id,
+        fa_version=kv.attention_config.fa_version,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
@@ -310,6 +315,8 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
         query,
         kv.key_cache(0),
         kv.value_cache(0),
+        backend_id=kv.attention_config.backend_id,
+        fa_version=kv.attention_config.fa_version,
         block_table=ctx.block_table,
         query_start_loc=ctx.query_start_loc,
         seq_lens=ctx.seq_lens,
@@ -321,10 +328,12 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
     assert torch.equal(paged, direct)
 
     # Matching the dense reference is necessary but not sufficient: the dense
-    # Python reference matches it too. Assert the accelerator kernel is what
-    # produced this, so a silent regression back to the reference fails here
-    # instead of passing slowly.
-    assert paged_attention_module.ar_diffusion_paged_attention_backend == device.type
+    # Python reference matches it too. Assert a native kernel is what produced
+    # this, so a silent regression back to the reference fails here instead of
+    # passing slowly. Checked against the config rather than device.type, since
+    # ROCm reports device.type == "cuda" but selects its own backend.
+    assert kv.attention_config.backend_id != paged_attention_module.BACKEND_REFERENCE
+    assert kv.attention_config.backend_name in ("cuda", "xpu", "rocm")
 
     new_k = torch.cat([history_k, current_k], dim=1)[:, -kv.spec.sliding_window :]
     new_v = torch.cat([history_v, current_v], dim=1)[:, -kv.spec.sliding_window :]
@@ -382,6 +391,10 @@ def test_prepare_is_idempotent_and_layers_share_metadata():
     assert i0.value_pool is kv._v_pools[0]
     assert i1.key_pool is kv._k_pools[1]
     assert i1.value_pool is kv._v_pools[1]
+    # The backend is decided once per cache, so every layer forwards the same
+    # two ints -- no per-layer decision, and no extra dynamo variants from them.
+    assert i0.attention_backend == i1.attention_backend == kv.attention_config.backend_id
+    assert i0.fa_version == i1.fa_version == kv.attention_config.fa_version
 
 
 def test_layer_inputs_before_prepare_raises():

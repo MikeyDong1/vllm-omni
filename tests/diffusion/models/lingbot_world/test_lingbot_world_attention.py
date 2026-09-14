@@ -189,14 +189,27 @@ def _install_vllm_stubs() -> None:
     class _PagedLayerInputs:
         pass
 
+    class _AttentionConfig:
+        """Stand-in for the resolved backend; only used as a type annotation here."""
+
+        backend_id = 0
+        fa_version = 0
+
     paged_attention.ARDiffusionPagedLayerContext = _PagedLayerContext
     paged_attention.ARDiffusionPagedLayerInputs = _PagedLayerInputs
+    paged_attention.ARDiffusionAttentionConfig = _AttentionConfig
     paged_attention.ar_diffusion_paged_attention = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("CUDA paged attention was not expected in this CPU test")
     )
     paged_attention.paged_write_attn = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("paged path was not expected in this direct-cache test")
     )
+    # Backend selection happens during allocation and only for the CUDA
+    # batch-size-1 replay path, so a CPU allocation must never reach it.
+    paged_attention.resolve_ar_diffusion_attention_config = lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError("backend resolution was not expected for a CPU cache")
+    )
+    paged_attention._reference_attn_allowed = lambda: False
 
 
 def _load_module():
@@ -250,6 +263,9 @@ def test_allocate_lingbot_cache_creates_request_local_layer_storage() -> None:
     assert cache.self_attention[0].key.dtype == torch.float32
     assert cache.self_attention[0].end == 0
     assert cache.self_attention[0].key.data_ptr() != cache.self_attention[1].key.data_ptr()
+    # A CPU cache never reaches the paged replay path, so no backend is resolved
+    # for it. The stub above would raise if allocation tried.
+    assert all(layer.paged_attention_config is None for layer in cache.self_attention)
 
 
 def _allocate_single_layer(module, *, max_tokens: int):

@@ -1,26 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Backend-dispatch tests for AR-Diffusion paged self-attention.
+"""Backend-selection and dispatch tests for AR-Diffusion paged self-attention.
 
-``ar_diffusion_paged_attention`` used to select its backend with
-``Tensor.is_cuda``, which is ``False`` on XPU and therefore routed every call to
-the dense Python reference. These cover the replacement contract:
+Selection used to happen inside the per-layer forward: it read ``Tensor.is_cuda``
+(``False`` on XPU, so every call went to the dense Python reference), probed
+kernel availability, read an env var, and caught the kernel's own RuntimeError.
+It now happens once, host-side, in ``resolve_ar_diffusion_attention_config``, and
+the forward only executes the ``backend_id`` it is handed. The two halves are
+tested separately:
 
-1. An accelerator with a paged kernel uses it, not ``_reference_paged_attention``.
-2. The kernel receives the original ``block_table`` and KV pools (no dense gather).
-3. CUDA still resolves an ``fa_version``; XPU does not need one.
-4. A missing kernel on such a device raises instead of degrading silently, and
-   the opt-in env switch restores the reference path tagged as ``"reference"``.
-5. CPU keeps the reference path.
+Selection (host, no tensors involved):
 
-Everything is CPU/mock based, so it needs no accelerator: ``query.device.type``
-is faked and vLLM's ``fa_utils`` entry points are stubbed. ``torch.version.hip``
-is pinned to ``None`` so the ROCm branch is not selected by the host build.
+1. CPU and management-only caches resolve to the reference backend.
+2. An accelerator with a bound kernel resolves to that kernel; CUDA carries an
+   ``fa_version``, XPU is FA2, and ROCm is identified before the CUDA branch.
+3. A missing kernel raises during setup, and the opt-in env switch turns that
+   into the reference backend instead.
+
+Execution (forward, given a backend):
+
+4. Each ``backend_id`` runs its own path, and the paged pools reach the kernel
+   as-is (no dense gather).
+5. Nothing is probed and no env var is read; kernel errors propagate rather than
+   selecting a different backend behind the caller's back.
+
+All CPU/mock based, so no accelerator is needed: ``torch.version.hip`` is pinned
+to ``None`` so the host build cannot pick the ROCm branch, and vLLM's ``fa_utils``
+entry points are stubbed. Note that the forward no longer inspects
+``query.device``, so these tests need no fake-device tensor subclass.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import builtins
+from dataclasses import FrozenInstanceError
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -39,6 +53,8 @@ SCALE = HEAD_DIM**-0.5
 _FA_FUNC = "vllm.v1.attention.backends.fa_utils.flash_attn_varlen_func"
 _FA_AVAILABLE = "vllm.v1.attention.backends.fa_utils.is_flash_attn_varlen_func_available"
 
+_real_import = builtins.__import__
+
 
 def _make_paged_inputs(kv_len=BLOCK, q_len=BLOCK):
     """Minimal (query, KV pools, block-table metadata) for one attention call."""
@@ -55,35 +71,13 @@ def _make_paged_inputs(kv_len=BLOCK, q_len=BLOCK):
     return query, key_cache, value_cache, block_table, query_start_loc, seq_lens
 
 
-class _FakeDeviceTensor(torch.Tensor):
-    """A real CPU tensor that reports an arbitrary ``device.type``.
-
-    A Tensor subclass so ``torch.empty_like`` / ``reshape`` keep working on real
-    CPU storage; only ``device`` is overridden, which is enough to make the
-    dispatch believe it is on cuda/xpu with no accelerator present.
-    """
-
-    _device_type = "cpu"
-
-    @staticmethod
-    def make(t: torch.Tensor, device_type: str) -> _FakeDeviceTensor:
-        obj = t.as_subclass(_FakeDeviceTensor)
-        obj._device_type = device_type
-        return obj
-
-    @property
-    def device(self):  # type: ignore[override]
-        class _D:
-            type = self._device_type
-
-        return _D()
-
-
-def _call(query, key_cache, value_cache, block_table, query_start_loc, seq_lens):
+def _call(query, key_cache, value_cache, block_table, query_start_loc, seq_lens, *, backend_id, fa_version=0):
     return pa.ar_diffusion_paged_attention(
         query,
         key_cache,
         value_cache,
+        backend_id=backend_id,
+        fa_version=fa_version,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
@@ -93,9 +87,150 @@ def _call(query, key_cache, value_cache, block_table, query_start_loc, seq_lens)
     )
 
 
+def _resolve(device_type, *, allow_reference=False, head_size=HEAD_DIM):
+    device = torch.device(device_type) if device_type is not None else None
+    return pa.resolve_ar_diffusion_attention_config(
+        device=device,
+        head_size=head_size,
+        allow_reference=allow_reference,
+    )
+
+
+# ── Selection ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("device_type", ["cpu", None])
+def test_devices_without_a_paged_kernel_resolve_to_reference(device_type):
+    """(1) CPU and management-only caches (``device=None``) need no accelerator probe."""
+    with patch(_FA_AVAILABLE, return_value=True) as available_mock:
+        config = _resolve(device_type)
+
+    assert config.backend_id == pa.BACKEND_REFERENCE
+    assert config.backend_name == "reference"
+    assert "no paged kernel" in config.reason
+    # Decided before any accelerator extension is consulted.
+    available_mock.assert_not_called()
+
+
+def test_accelerator_with_bound_kernel_resolves_to_that_kernel():
+    """(2) XPU is FA2; CUDA resolves a version from the head size."""
+    with (
+        patch("torch.version.hip", None),
+        patch(_FA_AVAILABLE, return_value=True),
+        patch.object(pa, "_resolve_fa_version", return_value=3) as version_mock,
+    ):
+        xpu = _resolve("xpu")
+        assert version_mock.call_count == 0, "fa_version is a CUDA concern"
+        cuda = _resolve("cuda")
+        assert version_mock.call_count == 1
+
+    assert (xpu.backend_id, xpu.fa_version, xpu.backend_name) == (pa.BACKEND_XPU, 2, "xpu")
+    assert (cuda.backend_id, cuda.fa_version, cuda.backend_name) == (pa.BACKEND_CUDA, 3, "cuda")
+    assert xpu.reason is None and cuda.reason is None
+
+
+def test_rocm_is_identified_before_the_cuda_branch():
+    """(2) HIP tensors report device.type == 'cuda', so hip must be checked first."""
+    with (
+        patch("torch.version.hip", "6.0.0"),
+        patch(_FA_AVAILABLE, return_value=True) as available_mock,
+    ):
+        config = _resolve("cuda")
+
+    assert config.backend_id == pa.BACKEND_ROCM
+    assert config.backend_name == "rocm"
+    # ROCm resolves its own entry point in the helper, not through fa_utils.
+    available_mock.assert_not_called()
+
+
 @pytest.mark.parametrize("device_type", ["xpu", "cuda"])
-def test_accelerator_uses_platform_kernel_not_reference(device_type):
-    """(1)+(2) An available kernel is used, and the paged inputs reach it as-is."""
+def test_missing_kernel_raises_during_setup(device_type):
+    """(3) No silent reference fallback on a device that should have a kernel."""
+    with (
+        patch("torch.version.hip", None),
+        patch(_FA_AVAILABLE, return_value=False),
+    ):
+        with pytest.raises(RuntimeError, match="refusing to fall back"):
+            _resolve(device_type, allow_reference=False)
+
+
+@pytest.mark.parametrize("device_type", ["xpu", "cuda"])
+def test_missing_kernel_with_opt_in_resolves_to_reference(device_type):
+    """(3) The opt-in turns the setup failure into the reference backend."""
+    with (
+        patch("torch.version.hip", None),
+        patch(_FA_AVAILABLE, return_value=False),
+    ):
+        config = _resolve(device_type, allow_reference=True)
+
+    assert config.backend_id == pa.BACKEND_REFERENCE
+    assert "no paged FlashAttention varlen entry point is bound" in config.reason
+
+
+def test_unimportable_fa_utils_is_reported_as_nothing_bound():
+    """(3) On XPU fa_utils pulls in vllm_xpu_kernels; a missing one is not a crash."""
+
+    def _import_without_fa_utils(name, globals=None, locals=None, fromlist=(), level=0):
+        if fromlist and "fa_utils" in fromlist:
+            raise ImportError("mock: no module named 'vllm_xpu_kernels'")
+        return _real_import(name, globals, locals, fromlist, level)
+
+    with patch("torch.version.hip", None), patch.object(builtins, "__import__", _import_without_fa_utils):
+        with pytest.raises(RuntimeError, match="cannot be imported"):
+            _resolve("xpu", allow_reference=False)
+        config = _resolve("xpu", allow_reference=True)
+
+    assert config.backend_id == pa.BACKEND_REFERENCE
+    assert "cannot be imported" in config.reason
+
+
+def test_env_switch_allows_but_does_not_force_reference(monkeypatch):
+    """The env var only feeds ``allow_reference``; a bound kernel still wins."""
+    monkeypatch.delenv(pa._ALLOW_REFERENCE_ATTN_ENV, raising=False)
+    assert pa._reference_attn_allowed() is False
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv(pa._ALLOW_REFERENCE_ATTN_ENV, value)
+        assert pa._reference_attn_allowed() is True
+    monkeypatch.setenv(pa._ALLOW_REFERENCE_ATTN_ENV, "0")
+    assert pa._reference_attn_allowed() is False
+
+    monkeypatch.setenv(pa._ALLOW_REFERENCE_ATTN_ENV, "1")
+    with patch("torch.version.hip", None), patch(_FA_AVAILABLE, return_value=True):
+        config = _resolve("xpu", allow_reference=pa._reference_attn_allowed())
+    assert config.backend_id == pa.BACKEND_XPU, "the switch must not force the reference path"
+
+
+def test_config_is_immutable_and_per_instance():
+    """No module-level 'last backend' state: each resolution is its own frozen value."""
+    with patch("torch.version.hip", None), patch(_FA_AVAILABLE, return_value=True):
+        first = _resolve("xpu")
+        second = _resolve("cpu")
+
+    assert first.backend_id == pa.BACKEND_XPU
+    assert second.backend_id == pa.BACKEND_REFERENCE, "resolving again must not mutate the first"
+    with pytest.raises(FrozenInstanceError):
+        first.backend_id = pa.BACKEND_CUDA
+    # The old design cached the last backend on the module, which two caches on
+    # two devices would race over. Nothing may reintroduce that.
+    assert not hasattr(pa, "ar_diffusion_paged_attention_backend")
+
+
+# ── Execution ───────────────────────────────────────────────────────────────
+
+
+def test_reference_backend_runs_the_dense_reference():
+    """(4) One reference branch, shared by CPU and the diagnostic opt-in."""
+    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
+    with patch(_FA_FUNC, create=True) as kernel_mock:
+        out = _call(q, kc, vc, bt, qsl, sl, backend_id=pa.BACKEND_REFERENCE)
+
+    assert out.shape == q.shape
+    kernel_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("backend_id", [pa.BACKEND_CUDA, pa.BACKEND_XPU])
+def test_native_backend_forwards_paged_inputs_unchanged(backend_id):
+    """(4) The kernel receives the block table and pools as-is -- no dense gather."""
     q, kc, vc, bt, qsl, sl = _make_paged_inputs()
     seen: dict[str, object] = {}
 
@@ -104,167 +239,92 @@ def test_accelerator_uses_platform_kernel_not_reference(device_type):
         return torch.zeros_like(kwargs["q"])
 
     with (
-        patch("torch.version.hip", None),
         patch(_FA_FUNC, side_effect=fake_fa, create=True),
-        patch(_FA_AVAILABLE, return_value=True),
         patch.object(pa, "_reference_paged_attention") as ref_mock,
     ):
-        out = _call(_FakeDeviceTensor.make(q, device_type), kc, vc, bt, qsl, sl)
+        out = _call(q, kc, vc, bt, qsl, sl, backend_id=backend_id, fa_version=2)
 
     ref_mock.assert_not_called()
-    assert pa.ar_diffusion_paged_attention_backend == device_type
     assert out.shape == q.shape
-    # Paged pools and block table are forwarded unchanged -- no dense gather.
     assert seen["block_table"] is bt
     assert seen["k"] is kc
     assert seen["v"] is vc
     assert seen["seqused_k"] is sl
+    assert seen["fa_version"] == 2, "the resolved version is passed through, not recomputed"
 
 
-def test_cuda_resolves_fa_version_xpu_does_not():
-    """(3) fa_version is a CUDA concern; the XPU kernel is FA2 and ignores it."""
+def test_returned_tensor_wins_over_the_out_buffer():
+    """The XPU wrapper returns its own tensor and may leave ``out`` untouched."""
     q, kc, vc, bt, qsl, sl = _make_paged_inputs()
-    versions: dict[str, object] = {}
+    owned = torch.full((q.shape[0], N_HEADS, HEAD_DIM), 7.0)
 
-    def fake_fa(**kwargs):
-        versions[str(kwargs["q"].device.type)] = kwargs["fa_version"]
-        return torch.zeros_like(kwargs["q"])
+    with patch(_FA_FUNC, return_value=owned, create=True):
+        out = _call(q, kc, vc, bt, qsl, sl, backend_id=pa.BACKEND_XPU, fa_version=2)
+    assert torch.equal(out, owned)
 
-    for device_type in ("cuda", "xpu"):
-        with (
-            patch("torch.version.hip", None),
-            patch(_FA_FUNC, side_effect=fake_fa, create=True),
-            patch(_FA_AVAILABLE, return_value=True),
-            patch.object(pa, "_resolve_fa_version", return_value=3) as ver_mock,
-        ):
-            _call(_FakeDeviceTensor.make(q, device_type), kc, vc, bt, qsl, sl)
-            assert ver_mock.call_count == (1 if device_type == "cuda" else 0)
-
-    assert versions == {"cuda": 3, "xpu": 2}
+    # A tuple return (CUDA) is unwrapped to its first element.
+    with patch(_FA_FUNC, return_value=(owned, None), create=True):
+        out = _call(q, kc, vc, bt, qsl, sl, backend_id=pa.BACKEND_CUDA, fa_version=3)
+    assert torch.equal(out, owned)
 
 
-@pytest.mark.parametrize("device_type", ["xpu", "cuda"])
-def test_missing_kernel_fails_fast(device_type, monkeypatch):
-    """(4) No silent reference fallback on a device that should have a kernel."""
+def test_batched_query_keeps_its_shape():
+    """A (B, L, H, D) query is flattened for the kernel and restored on the way out."""
+    _, kc, vc, bt, qsl, sl = _make_paged_inputs()
+    query = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM)
+
+    with patch(_FA_FUNC, side_effect=lambda **kw: torch.zeros_like(kw["q"]), create=True) as kernel_mock:
+        out = _call(query, kc, vc, bt, qsl, sl, backend_id=pa.BACKEND_CUDA, fa_version=3)
+
+    assert kernel_mock.call_args.kwargs["q"].shape == (BLOCK, N_HEADS, HEAD_DIM)
+    assert out.shape == query.shape
+
+
+@pytest.mark.parametrize("backend_id", [pa.BACKEND_CUDA, pa.BACKEND_XPU])
+def test_kernel_errors_propagate(backend_id):
+    """(5) Including a page-size refusal: no branch absorbs it into the reference.
+
+    ``is_flash_attn_varlen_func_available()`` answers "is an entry point bound",
+    not "can it service this geometry", so an unsupported page size can only
+    surface from the kernel. Selection has already happened by then, and turning
+    that error into a different backend mid-forward is what this replaces.
+    """
     q, kc, vc, bt, qsl, sl = _make_paged_inputs()
-    monkeypatch.delenv(pa._ALLOW_REFERENCE_ATTN_ENV, raising=False)
+
+    def refusing_fa(**kwargs):
+        raise RuntimeError(f"chunk_prefill: unsupported block_size={kc.shape[1]}")
 
     with (
-        patch("torch.version.hip", None),
-        patch(_FA_AVAILABLE, return_value=False),
+        patch(_FA_FUNC, side_effect=refusing_fa, create=True),
         patch.object(pa, "_reference_paged_attention") as ref_mock,
     ):
-        with pytest.raises(RuntimeError, match="refusing to fall back"):
-            _call(_FakeDeviceTensor.make(q, device_type), kc, vc, bt, qsl, sl)
+        with pytest.raises(RuntimeError, match="unsupported block_size"):
+            _call(q, kc, vc, bt, qsl, sl, backend_id=backend_id, fa_version=2)
 
     ref_mock.assert_not_called()
 
 
-def test_missing_kernel_with_env_switch_uses_reference(monkeypatch):
-    """(4b) The opt-in switch restores the reference path, tagged as such."""
+def test_forward_never_probes_capability_or_reads_the_environment(monkeypatch):
+    """(5) The whole point of the refactor: no per-call setup work."""
     q, kc, vc, bt, qsl, sl = _make_paged_inputs()
     monkeypatch.setenv(pa._ALLOW_REFERENCE_ATTN_ENV, "1")
+    allowed_mock = MagicMock(return_value=True)
+    version_mock = MagicMock(return_value=3)
 
     with (
-        patch("torch.version.hip", None),
-        patch(_FA_AVAILABLE, return_value=False),
-        patch.object(pa, "_reference_paged_attention", return_value=torch.zeros_like(q)) as ref_mock,
+        patch(_FA_FUNC, side_effect=lambda **kw: torch.zeros_like(kw["q"]), create=True),
+        patch(_FA_AVAILABLE, return_value=True) as available_mock,
+        patch.object(pa, "_reference_attn_allowed", allowed_mock),
+        patch.object(pa, "_resolve_fa_version", version_mock),
     ):
-        _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
+        _call(q, kc, vc, bt, qsl, sl, backend_id=pa.BACKEND_CUDA, fa_version=3)
 
-    ref_mock.assert_called_once()
-    assert pa.ar_diffusion_paged_attention_backend == "reference"
+    available_mock.assert_not_called()
+    allowed_mock.assert_not_called()
+    version_mock.assert_not_called()
 
 
-def test_cpu_uses_reference_backend():
-    """(5) CPU has no paged kernel: dense reference, tagged 'reference'."""
+def test_unknown_backend_is_rejected():
     q, kc, vc, bt, qsl, sl = _make_paged_inputs()
-    out = _call(q, kc, vc, bt, qsl, sl)
-    assert out.shape == q.shape
-    assert pa.ar_diffusion_paged_attention_backend == "reference"
-
-
-def test_xpu_page_size_refusal_falls_back_and_is_remembered(monkeypatch):
-    """A kernel that refuses the page size must degrade loudly, not abort.
-
-    ``is_flash_attn_varlen_func_available()`` reports True on XPU unconditionally --
-    it answers "is an entry point bound", not "can it service this geometry". The
-    page-size check lives in the kernel's C++ and raises from there, so without this
-    path a build that refuses DreamZero's frame-length page turns a working (if slow)
-    XPU run into a hard abort, and the env-var escape hatch never even runs.
-
-    The refusal is recorded, so later calls skip the failed dispatch entirely rather
-    than paying it once per layer per step.
-
-    ``_reference_paged_attention`` is mocked here because this test is about
-    *dispatch*, not reference numerics: the fake-device query carries a stand-in
-    ``device`` object that ``torch.arange(..., device=...)`` inside the real
-    reference cannot accept. Reference numerics are covered on genuine CPU
-    tensors by ``test_paged_attention_matches_dense_reference_cpu``.
-    """
-    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
-    monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
-    page_size = kc.shape[1]
-
-    calls = {"kernel": 0}
-
-    def refusing_fa(**kwargs):
-        calls["kernel"] += 1
-        raise RuntimeError(f"chunk_prefill: unsupported block_size={page_size} (supported: 16, 32, ...)")
-
-    with (
-        patch("torch.version.hip", None),
-        patch(_FA_FUNC, side_effect=refusing_fa, create=True),
-        patch(_FA_AVAILABLE, return_value=True),
-        patch.object(pa, "_reference_paged_attention", return_value=torch.zeros_like(q)) as ref_mock,
-    ):
-        first = _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
-        assert pa.ar_diffusion_paged_attention_backend == "reference"
-        assert first.shape == q.shape
-        assert page_size in pa._XPU_REJECTED_PAGE_SIZES
-        assert ref_mock.call_count == 1
-
-        second = _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
-
-    assert calls["kernel"] == 1, "the refused page size should not be retried per call"
-    assert ref_mock.call_count == 2, "the second call must still be served by the reference"
-    assert second.shape == q.shape
-    assert pa.ar_diffusion_paged_attention_backend == "reference"
-
-
-def test_unrelated_kernel_errors_still_propagate(monkeypatch):
-    """Only the page-size complaint is absorbed; real failures must not be hidden."""
-    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
-    monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
-
-    def exploding_fa(**kwargs):
-        raise RuntimeError("XPU out of memory")
-
-    with (
-        patch("torch.version.hip", None),
-        patch(_FA_FUNC, side_effect=exploding_fa, create=True),
-        patch(_FA_AVAILABLE, return_value=True),
-    ):
-        with pytest.raises(RuntimeError, match="out of memory"):
-            _call(_FakeDeviceTensor.make(q, "xpu"), kc, vc, bt, qsl, sl)
-
-    assert pa._XPU_REJECTED_PAGE_SIZES == set()
-
-
-def test_cuda_page_size_errors_are_not_absorbed(monkeypatch):
-    """The refusal path is XPU-only; CUDA has no such page-size constraint."""
-    q, kc, vc, bt, qsl, sl = _make_paged_inputs()
-    monkeypatch.setattr(pa, "_XPU_REJECTED_PAGE_SIZES", set())
-
-    def refusing_fa(**kwargs):
-        raise RuntimeError("chunk_prefill: unsupported block_size=880")
-
-    with (
-        patch("torch.version.hip", None),
-        patch(_FA_FUNC, side_effect=refusing_fa, create=True),
-        patch(_FA_AVAILABLE, return_value=True),
-    ):
-        with pytest.raises(RuntimeError, match="unsupported block_size"):
-            _call(_FakeDeviceTensor.make(q, "cuda"), kc, vc, bt, qsl, sl)
-
-    assert pa._XPU_REJECTED_PAGE_SIZES == set()
+    with pytest.raises(ValueError, match="Unknown attention backend"):
+        _call(q, kc, vc, bt, qsl, sl, backend_id=99)

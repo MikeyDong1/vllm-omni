@@ -27,10 +27,13 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionAttentionConfig,
     ARDiffusionPagedLayerContext,
     ARDiffusionPagedLayerInputs,
+    _reference_attn_allowed,
     ar_diffusion_paged_attention,
     paged_write_attn,
+    resolve_ar_diffusion_attention_config,
 )
 
 
@@ -42,6 +45,10 @@ class LingBotAttentionCache:
     position, and ``sink_end`` separates permanently retained prefix tokens
     from the sliding local window. ``last_start`` rejects overlapping or
     out-of-order causal chunks.
+
+    ``paged_attention_config`` is the backend selected during allocation, needed
+    only by self-attention caches that reach ``ar_diffusion_paged_attention``
+    directly. ``None`` for cross-attention and any cache off that path.
     """
 
     key: torch.Tensor
@@ -50,6 +57,7 @@ class LingBotAttentionCache:
     absolute_end: int = 0
     last_start: int | None = None
     sink_end: int = 0
+    paged_attention_config: ARDiffusionAttentionConfig | None = None
 
 
 @dataclass
@@ -70,12 +78,24 @@ def allocate_lingbot_cache(
     device: torch.device,
     dtype: torch.dtype,
 ) -> LingBotTransformerCache:
+    # Resolve once, only for the conditions under which self-attention replay
+    # calls ar_diffusion_paged_attention directly (query.is_cuda and
+    # query.shape[0] == 1 at the call site). Anything else keeps using self.attn.
+    paged_attention_config = None
+    if device.type == "cuda" and batch_size == 1:
+        paged_attention_config = resolve_ar_diffusion_attention_config(
+            device=device,
+            head_size=head_dim,
+            allow_reference=_reference_attn_allowed(),
+        )
+
     # Cross-attention starts empty because its token count is known after text encoding.
     shape = (batch_size, max_tokens, num_local_heads, head_dim)
     self_attention = [
         LingBotAttentionCache(
             key=torch.zeros(shape, device=device, dtype=dtype),
             value=torch.zeros(shape, device=device, dtype=dtype),
+            paged_attention_config=paged_attention_config,
         )
         for _ in range(num_layers)
     ]
@@ -315,6 +335,13 @@ class LingBotSelfAttention(nn.Module):
                 # realtime path so direct replay is a numerical oracle for
                 # paged execution, rather than a comparison between two
                 # different attention kernels.
+                attention_config = cache.paged_attention_config
+                if attention_config is None:
+                    # Never resolve a backend from inside a forward.
+                    raise RuntimeError(
+                        "LingBot self-attention cache has no paged_attention_config; build it through "
+                        "allocate_lingbot_cache() so the paged-attention backend is selected during setup."
+                    )
                 block_size = key.shape[1]
                 key_cache = visible_key[0].unflatten(0, (-1, block_size))
                 value_cache = visible_value[0].unflatten(0, (-1, block_size))
@@ -338,6 +365,8 @@ class LingBotSelfAttention(nn.Module):
                     query,
                     key_cache,
                     value_cache,
+                    backend_id=attention_config.backend_id,
+                    fa_version=attention_config.fa_version,
                     block_table=block_table,
                     query_start_loc=query_start_loc,
                     seq_lens=seq_lens,

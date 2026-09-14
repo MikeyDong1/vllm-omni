@@ -19,38 +19,118 @@ _log = init_logger(__name__)
 # Fail by default: correct reference output can hide a severe slowdown.
 _ALLOW_REFERENCE_ATTN_ENV = "VLLM_OMNI_AR_DIFFUSION_ALLOW_REFERENCE_ATTN"
 
-# Most recent backend: "cuda", "xpu", "rocm", or "reference".
-# Expose reference fallback for diagnostics.
-ar_diffusion_paged_attention_backend: str | None = None
-
 
 def _reference_attn_allowed() -> bool:
+    """Read the diagnostic opt-in. Call when building a configuration, not in a forward."""
     return os.environ.get(_ALLOW_REFERENCE_ATTN_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-# Page sizes rejected by the installed XPU kernel. A bound entry point does
-# not guarantee geometry support; remember runtime refusals to avoid retrying
-# the same unsupported page size on every layer and step.
-_XPU_REJECTED_PAGE_SIZES: set[int] = set()
-_KERNEL_PAGE_SIZE_REJECTION = "unsupported block_size"
+# Which kernel serves paged self-attention is a property of the build and the
+# device, not of the tensors in a layer. Resolved once at initialization and
+# passed to the forward as two plain ints (see ARDiffusionPagedLayerInputs).
+BACKEND_REFERENCE = 0
+BACKEND_CUDA = 1
+BACKEND_XPU = 2
+BACKEND_ROCM = 3
+
+_BACKEND_NAMES = {
+    BACKEND_REFERENCE: "reference",
+    BACKEND_CUDA: "cuda",
+    BACKEND_XPU: "xpu",
+    BACKEND_ROCM: "rocm",
+}
 
 
-def _record_rejected_page_size(device_type: str, page_size: int, exc: RuntimeError) -> None:
-    """Cache only XPU page-size refusals; propagate all other kernel errors."""
-    if device_type != "xpu" or _KERNEL_PAGE_SIZE_REJECTION not in str(exc):
-        raise exc
-    _XPU_REJECTED_PAGE_SIZES.add(page_size)
-    _log.warning_once(
-        "The installed vllm-xpu-kernels build refuses a %d-token KV page for paged "
-        "attention, so AR-Diffusion is falling back to the dense Python reference "
-        "(expect a large slowdown; ar_diffusion_paged_attention_backend reports "
-        "'reference'). Its chunk_prefill accepts 16, 32, or a positive multiple of "
-        "64; the real kernel constraint is any positive multiple of 16. Upgrade to a "
-        "build whose validation reflects that, or configure a page size it accepts. "
-        "Kernel error: %s",
-        page_size,
-        exc,
+@dataclass(frozen=True)
+class ARDiffusionAttentionConfig:
+    """One resolved dispatch decision, held per KV-cache instance.
+
+    ``backend_id`` is a ``BACKEND_*`` constant. ``fa_version`` is unused by the
+    reference and ROCm paths. ``reason`` is for logging only.
+    """
+
+    backend_id: int
+    fa_version: int = 0
+    reason: str | None = None
+
+    @property
+    def backend_name(self) -> str:
+        return _BACKEND_NAMES.get(self.backend_id, f"unknown({self.backend_id})")
+
+
+def _reference_or_raise(device_type: str, reason: str, allow_reference: bool) -> ARDiffusionAttentionConfig:
+    """No entry point bound for an accelerator: fail setup, or take the opt-in."""
+    if not allow_reference:
+        raise RuntimeError(
+            f"AR-Diffusion paged attention has no usable kernel on device '{device_type}': {reason}; "
+            "refusing to fall back to the dense Python reference, which is correct but far slower. "
+            f"Set {_ALLOW_REFERENCE_ATTN_ENV}=1 to allow it for debugging, or install a build whose "
+            "paged FlashAttention varlen entry point is bound for this device."
+        )
+    _log.warning(
+        "%s is set: %s on '%s', so AR-Diffusion paged self-attention uses the dense Python "
+        "reference. DEBUG ONLY -- expect a large slowdown.",
+        _ALLOW_REFERENCE_ATTN_ENV,
+        reason,
+        device_type,
     )
+    return ARDiffusionAttentionConfig(BACKEND_REFERENCE, 0, reason)
+
+
+def resolve_ar_diffusion_attention_config(
+    *,
+    device: torch.device | None,
+    head_size: int,
+    allow_reference: bool,
+) -> ARDiffusionAttentionConfig:
+    """Select the paged-attention backend. Initialization only, never a forward.
+
+    Call after the worker has bound its device. Validates that an entry point is
+    bound, not that the build has a kernel for every geometry: an unsupported
+    geometry surfaces from the kernel when it is invoked.
+    """
+    device_type = device.type if device is not None else "cpu"
+
+    if device_type not in ("cuda", "xpu"):
+        return _log_selected(
+            ARDiffusionAttentionConfig(BACKEND_REFERENCE, 0, f"device '{device_type}' has no paged kernel"),
+            device_type,
+        )
+
+    if device_type == "cuda" and torch.version.hip is not None:
+        # HIP tensors report device.type == "cuda", so check ROCm first.
+        return _log_selected(ARDiffusionAttentionConfig(BACKEND_ROCM), device_type)
+
+    # On XPU this transitively imports vllm_xpu_kernels; treat a missing one as
+    # "nothing is bound" rather than letting ImportError escape initialization.
+    try:
+        from vllm.v1.attention.backends import fa_utils
+    except ImportError as exc:
+        reason = f"vLLM's FlashAttention utilities cannot be imported ({exc})"
+        return _log_selected(_reference_or_raise(device_type, reason, allow_reference), device_type)
+
+    if not fa_utils.is_flash_attn_varlen_func_available():
+        return _log_selected(
+            _reference_or_raise(device_type, "no paged FlashAttention varlen entry point is bound", allow_reference),
+            device_type,
+        )
+
+    if device_type == "xpu":
+        # The XPU kernel is FA2 and ignores the argument.
+        return _log_selected(ARDiffusionAttentionConfig(BACKEND_XPU, 2), device_type)
+    # CUDA picks a kernel version per head size.
+    return _log_selected(ARDiffusionAttentionConfig(BACKEND_CUDA, _resolve_fa_version(head_size)), device_type)
+
+
+def _log_selected(config: ARDiffusionAttentionConfig, device_type: str) -> ARDiffusionAttentionConfig:
+    _log.info(
+        "AR-Diffusion paged attention backend=%s device=%s fa_version=%d%s",
+        config.backend_name,
+        device_type,
+        config.fa_version,
+        f" reason={config.reason}" if config.reason else "",
+    )
+    return config
 
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
@@ -77,6 +157,10 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     value guard (``layer_idx == k``) — 40 cache variants that blow the
     recompile limit. A tensor input guards on shape/dtype only, so one graph
     serves every layer.
+
+    ``attention_backend`` / ``fa_version`` carry the selection made at KV cache
+    initialization. Ints, because they cross a custom op boundary; every layer
+    shares the same two values, so unlike ``layer_idx`` they add no variants.
     """
 
     layer_idx: torch.Tensor
@@ -91,6 +175,8 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     seq_lens: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    attention_backend: int
+    fa_version: int
 
 
 @dataclass
@@ -266,6 +352,8 @@ class ARDiffusionPagedForwardContext:
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
         if not getattr(self, "_prepared", False):
             raise RuntimeError("ARDiffusionPagedForwardContext.layer_inputs() before prepare()")
+        # Resolved once at KV cache initialization; only forwarded here.
+        attention_config = self.kv_cache.attention_config
         return ARDiffusionPagedLayerInputs(
             layer_idx=_layer_idx_tensor(layer_idx),
             key_pool=self.kv_cache._k_pools[layer_idx],
@@ -279,6 +367,8 @@ class ARDiffusionPagedForwardContext:
             seq_lens=self.seq_lens,
             max_query_len=int(self.max_query_len),
             max_seq_len=int(self.max_seq_len),
+            attention_backend=int(attention_config.backend_id),
+            fa_version=int(attention_config.fa_version),
         )
 
     def mark_committed(self) -> None:
@@ -421,6 +511,8 @@ def ar_diffusion_paged_attention(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     *,
+    backend_id: int,
+    fa_version: int,
     block_table: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -429,13 +521,15 @@ def ar_diffusion_paged_attention(
     softmax_scale: float,
     causal: bool = False,
 ) -> torch.Tensor:
-    """Run non-causal paged attention over a vLLM block table.
+    """Execute the backend already selected for this KV cache.
 
     ``query`` may be ``(B, L, H, D)`` or already flattened as ``(T, H, D)``.
     ``key_cache`` / ``value_cache`` are ``(num_blocks, block_size, H, D)``.
-    """
-    global ar_diffusion_paged_attention_backend
 
+    ``backend_id`` / ``fa_version`` come from
+    ``resolve_ar_diffusion_attention_config``. Nothing here probes capability or
+    catches kernel errors: an unsupported page size propagates to the caller.
+    """
     batched = query.dim() == 4
     if batched:
         batch, q_len = query.shape[:2]
@@ -443,12 +537,9 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
-    # XPU has a paged kernel but reports Tensor.is_cuda == False; dispatch by type.
-    device_type = query_flat.device.type
-    page_size = int(key_cache.shape[1])
-
-    def reference() -> torch.Tensor:
-        return _reference_paged_attention(
+    if backend_id == BACKEND_REFERENCE:
+        # One reference branch, shared by CPU and the diagnostic opt-in.
+        out = _reference_paged_attention(
             query_flat,
             key_cache,
             value_cache,
@@ -458,16 +549,7 @@ def ar_diffusion_paged_attention(
             softmax_scale,
             causal=causal,
         )
-
-    if device_type not in ("cuda", "xpu"):
-        # Other devices use the reference path for tests and debugging.
-        ar_diffusion_paged_attention_backend = "reference"
-        out = reference()
-    elif device_type == "xpu" and page_size in _XPU_REJECTED_PAGE_SIZES:
-        # Skip a page size already rejected by this kernel build.
-        ar_diffusion_paged_attention_backend = "reference"
-        out = reference()
-    elif device_type == "cuda" and torch.version.hip is not None:
+    elif backend_id == BACKEND_ROCM:
         # vllm.vllm_flash_attn contains CUDA-only extensions. ROCm's AITER and
         # upstream flash-attn expose the standard cu_seqlens_k API instead of
         # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
@@ -495,61 +577,34 @@ def ar_diffusion_paged_attention(
             softmax_scale=float(softmax_scale),
             causal=causal,
         )
-        ar_diffusion_paged_attention_backend = "rocm"
-    else:
-        # fa_utils selects the CUDA or XPU kernel. Pass paged pools directly,
-        # without gathering dense K/V copies.
+    elif backend_id in (BACKEND_CUDA, BACKEND_XPU):
+        # Paged pools go to the kernel as they are, no dense gather. XPU reaches
+        # here too: it has a paged kernel but reports Tensor.is_cuda == False.
         from vllm.v1.attention.backends import fa_utils
 
-        if not fa_utils.is_flash_attn_varlen_func_available():
-            if not _reference_attn_allowed():
-                raise RuntimeError(
-                    f"Paged FlashAttention is unavailable on device '{device_type}'; refusing to fall back "
-                    "to the dense Python reference, which is correct but far slower. Set "
-                    f"{_ALLOW_REFERENCE_ATTN_ENV}=1 to allow it for debugging."
-                )
-            _log.warning_once(
-                "%s is set: paged FlashAttention is unavailable on '%s', using the dense Python "
-                "reference. DEBUG ONLY -- expect a large slowdown.",
-                _ALLOW_REFERENCE_ATTN_ENV,
-                device_type,
-            )
-            ar_diffusion_paged_attention_backend = "reference"
-            out = reference()
-        else:
-            # CUDA picks a kernel version per head size; the XPU kernel is FA2
-            # and ignores the argument.
-            fa_version = _resolve_fa_version(query_flat.shape[-1]) if device_type == "cuda" else 2
-
-            out = torch.empty_like(query_flat)
-            try:
-                result = fa_utils.flash_attn_varlen_func(
-                    q=query_flat,
-                    k=key_cache,
-                    v=value_cache,
-                    out=out,
-                    cu_seqlens_q=query_start_loc,
-                    max_seqlen_q=int(max_query_len),
-                    seqused_k=seq_lens,
-                    max_seqlen_k=int(max_seq_len),
-                    softmax_scale=float(softmax_scale),
-                    causal=causal,
-                    block_table=block_table,
-                    fa_version=fa_version,
-                )
-            except RuntimeError as exc:
-                # Re-raises unless this is the XPU kernel refusing the page size.
-                _record_rejected_page_size(device_type, page_size, exc)
-                ar_diffusion_paged_attention_backend = "reference"
-                out = reference()
-            else:
-                # CUDA may write into out and return a tensor or tuple; XPU returns its
-                # own tensor. Prefer the returned value, keeping out as the fallback.
-                if isinstance(result, (tuple, list)):
-                    result = result[0] if result else None
-                if result is not None:
-                    out = result
-                ar_diffusion_paged_attention_backend = device_type
+        out = torch.empty_like(query_flat)
+        result = fa_utils.flash_attn_varlen_func(
+            q=query_flat,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=query_start_loc,
+            max_seqlen_q=int(max_query_len),
+            seqused_k=seq_lens,
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
+            causal=causal,
+            block_table=block_table,
+            fa_version=fa_version,
+        )
+        # CUDA may write into out and return a tensor or tuple; the XPU wrapper
+        # returns its own tensor and may leave out untouched.
+        if isinstance(result, (tuple, list)):
+            result = result[0] if result else None
+        if result is not None:
+            out = result
+    else:
+        raise ValueError(f"Unknown attention backend: {backend_id}")
 
     if batched:
         return out.reshape(query.shape)
@@ -581,6 +636,8 @@ def _paged_write_attn_impl(
     max_query_len: int,
     max_seq_len: int,
     softmax_scale: float,
+    attention_backend: int,
+    fa_version: int,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
@@ -593,6 +650,8 @@ def _paged_write_attn_impl(
         query,
         key_cache,
         value_cache,
+        backend_id=attention_backend,
+        fa_version=fa_version,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
@@ -628,6 +687,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         max_query_len: int,
         max_seq_len: int,
         softmax_scale: float,
+        attention_backend: int,
+        fa_version: int,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -646,6 +707,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             max_query_len,
             max_seq_len,
             softmax_scale,
+            attention_backend,
+            fa_version,
         )
 
     @_paged_write_attn_op.register_fake
@@ -666,6 +729,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         max_query_len,
         max_seq_len,
         softmax_scale,
+        attention_backend,
+        fa_version,
     ):
         return torch.empty_like(query)
 
@@ -691,4 +756,6 @@ def paged_write_attn(
         inputs.max_query_len,
         inputs.max_seq_len,
         softmax_scale,
+        inputs.attention_backend,
+        inputs.fa_version,
     )

@@ -35,6 +35,10 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     pool_write_chunk,
     resident_block_ids,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    _reference_attn_allowed,
+    resolve_ar_diffusion_attention_config,
+)
 
 _log = init_logger(__name__)
 
@@ -221,6 +225,18 @@ class ARDiffusionKVCache:
             raise ValueError(f"cross_attention_lengths must be positive, got {invalid_cross}")
         self.device = device or torch.device("cpu")
         self._allocate_tensors = device is not None
+
+        # Select the paged-attention backend once, here: the device and head size
+        # are final. Held per instance so concurrent caches cannot overwrite each
+        # other's selection. Raises when an accelerator has no entry point bound
+        # and the diagnostic switch is unset, surfacing that at setup instead of
+        # from inside a per-layer forward.
+        self.attention_config = resolve_ar_diffusion_attention_config(
+            device=self.device,
+            head_size=self.head_size,
+            allow_reference=_reference_attn_allowed(),
+        )
+
         self._adapters: dict[str, ARDiffusionRequestAdapter] = {}
         self._cross_sessions: dict[
             str,

@@ -27,14 +27,17 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     resident_block_ids,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionAttentionConfig,
     ARDiffusionPagedForwardContext,
     ARDiffusionPagedLayerContext,
     ARDiffusionPagedLayerInputs,
     ar_diffusion_paged_attention,
     paged_write_attn,
+    resolve_ar_diffusion_attention_config,
 )
 
 __all__ = [
+    "ARDiffusionAttentionConfig",
     "ARDiffusionKVCache",
     "ARDiffusionKVConfig",
     "ARDiffusionPagedForwardContext",
@@ -52,4 +55,5 @@ __all__ = [
     "paged_write_attn",
     "pool_write_chunk",
     "resident_block_ids",
+    "resolve_ar_diffusion_attention_config",
 ]

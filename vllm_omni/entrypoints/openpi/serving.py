@@ -31,6 +31,38 @@ ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 # Roles running the observation encoders; the rest read the stage payload.
 _OBSERVATION_ROLES = frozenset({"full", "encode"})
 
+# Kept in sync with vllm_omni.engine.orchestrator; named here so this module does
+# not pull the orchestrator into the serving import graph.
+CLOSE_COORDINATED_SESSION = "close_coordinated_session"
+
+# Upper bound on one coordinated close; a disconnect must not hang a socket.
+DEFAULT_SESSION_CLOSE_TIMEOUT_S = 30.0
+
+
+def _collect_rpc_errors(results: Any) -> list[str]:
+    """Read failures out of a control-RPC reply; ``True`` is the only success."""
+    errors: list[str] = []
+    acknowledged = False
+    for result in results or ():
+        if result is True:
+            acknowledged = True
+            continue
+        if isinstance(result, Mapping):
+            errors.append(str(result.get("error") or f"unsupported reply {sorted(result)!r}"))
+            continue
+        errors.append(f"unexpected reply {result!r}")
+    if not errors and not acknowledged:
+        errors.append("no stage acknowledged the operation")
+    return errors
+
+
+def _resolve_coordinated_lifecycle(engine_client: Any) -> bool:
+    """Whether any configured stage declares topology-coordinated lifecycle."""
+    for stage_config in getattr(engine_client, "stage_configs", None) or ():
+        if bool(getattr(stage_config, "coordinated_session_lifecycle", False)):
+            return True
+    return False
+
 
 def _to_builtin_container(value: Any) -> Any:
     if OmegaConf.is_config(value):
@@ -155,9 +187,13 @@ class ServingRealtimeRobotOpenPI:
         self.policy_server_config = self._get_policy_server_config(engine_client)
         self._request_counter = count()
         self.stage_roles = _resolve_stage_roles(engine_client)
+        self.coordinated_session_lifecycle = _resolve_coordinated_lifecycle(engine_client)
+        self.session_close_timeout_s = DEFAULT_SESSION_CLOSE_TIMEOUT_S
         # Connections holding each live session id, so one socket disconnecting
         # does not close a session another is still driving.
         self._session_refcounts: Counter[str] = Counter()
+        self._closing_sessions: set[str] = set()
+        self._failed_closes: set[str] = set()
 
     @property
     def num_stages(self) -> int:
@@ -206,8 +242,28 @@ class ServingRealtimeRobotOpenPI:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
     def acquire_session(self, session_id: str) -> None:
-        """Record that one more connection is using ``session_id``."""
-        self._session_refcounts[str(session_id)] += 1
+        """Record that one more connection is using ``session_id``.
+
+        Refused while that id is being torn down or has an unresolved failed
+        close: acquiring it would attach a new rollout to state that is about to
+        be destroyed, or that nothing has confirmed is gone.
+        """
+        key = str(session_id)
+        if key in self._closing_sessions:
+            raise RuntimeError(
+                f"Robot OpenPI session {key!r} is being closed; a new rollout cannot take the id until that finishes."
+            )
+        if key in self._failed_closes:
+            raise RuntimeError(
+                f"Robot OpenPI session {key!r} has an unresolved failed close, so its model state "
+                "may still exist. The id cannot be reused until cleanup is confirmed."
+            )
+        self._session_refcounts[key] += 1
+
+    @property
+    def unresolved_closes(self) -> frozenset[str]:
+        """Session ids whose close failed and whose model state is unaccounted for."""
+        return frozenset(self._failed_closes)
 
     def session_refcount(self, session_id: str) -> int:
         return int(self._session_refcounts.get(str(session_id), 0))
@@ -228,19 +284,59 @@ class ServingRealtimeRobotOpenPI:
             )
             return False
         self._session_refcounts.pop(key, None)
-        await self.close_session(key)
+        # Marked while the close runs so a concurrent acquire cannot take the id,
+        # and recorded on failure so the unaccounted-for state is not forgotten
+        # just because the last connection's reference is gone.
+        self._closing_sessions.add(key)
+        try:
+            await self.close_session(key)
+        except Exception:
+            self._failed_closes.add(key)
+            raise
+        finally:
+            self._closing_sessions.discard(key)
+        self._failed_closes.discard(key)
         return True
 
     async def close_session(self, session_id: str) -> None:
-        """Release model-side session state for ``session_id``, awaiting async hooks."""
+        """Release model-side session state for ``session_id``.
+
+        A coordinated topology has its state in worker processes the serving layer
+        cannot touch, so the close goes through the engine's control plane and is
+        only reported done once the coordinator has retired every participant. An
+        in-process client keeps the direct pipeline hook.
+        """
+        if self.coordinated_session_lifecycle:
+            await self._close_remote_session(session_id)
+            return
         result = self.drop_session(session_id)
         if inspect.isawaitable(result):
             await result
 
-    def drop_session(self, session_id: str) -> Any:
-        """Best-effort release of model-side session state for a closed rollout.
+    async def _close_remote_session(self, session_id: str) -> None:
+        """Close through the orchestrator's lifecycle coordinator, or fail loudly."""
+        rpc = getattr(self.engine_client, "collective_rpc", None)
+        if not callable(rpc):
+            raise RuntimeError(
+                f"Robot OpenPI cannot close session {session_id!r}: this deployment declares a "
+                "coordinated session lifecycle, but its engine client exposes no collective_rpc() "
+                "to reach the orchestrator. Worker state would leak on every disconnect."
+            )
+        results = await rpc(
+            method=CLOSE_COORDINATED_SESSION,
+            args=(str(session_id),),
+            timeout=self.session_close_timeout_s,
+        )
+        errors = _collect_rpc_errors(results)
+        if errors:
+            raise RuntimeError(f"Robot OpenPI close of session {session_id!r} was not confirmed: " + "; ".join(errors))
 
-        Returns the hook's result so ``close_session`` can await an async hook.
+    def drop_session(self, session_id: str) -> Any:
+        """Best-effort release of model-side session state for an in-process client.
+
+        Returns the hook's result so ``close_session`` can await an async hook. A
+        model with no per-session state legitimately has no hook; a coordinated
+        deployment never reaches here.
         """
         drop = getattr(self.engine_client, "drop_session", None)
         if callable(drop):
@@ -251,7 +347,7 @@ class ServingRealtimeRobotOpenPI:
             if callable(close):
                 return close(session_id)
         logger.debug(
-            "Robot OpenPI found no session-release hook for %s; model state is left to the engine",
+            "Robot OpenPI found no session-release hook for %s; this policy keeps no session state",
             session_id,
         )
         return None

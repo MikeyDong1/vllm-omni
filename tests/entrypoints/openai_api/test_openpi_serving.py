@@ -649,3 +649,120 @@ def test_release_session_waits_for_the_last_connection_holding_it():
     assert asyncio.run(serving.release_session("shared")) is True
     assert closed == ["shared"]
     assert serving.session_refcount("shared") == 0
+
+
+# -- coordinated remote close ------------------------------------------------
+
+
+class FakeControlPlane:
+    """An engine client that answers the orchestrator's lifecycle control RPC.
+
+    Mirrors the real reply contract: ``True`` for a confirmed close and a
+    ``{"supported": False, "error": ...}`` mapping for a failure.
+    """
+
+    def __init__(self, *, reply=True, roles=("encode", "denoise", "decode")):
+        self.reply = reply
+        self.calls: list[dict] = []
+        self.stage_configs = [
+            SimpleNamespace(
+                stage_type="diffusion",
+                stage_role=role,
+                model_stage=role,
+                coordinated_session_lifecycle=True,
+                engine_args=(
+                    SimpleNamespace(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+                    if index == 0
+                    else None
+                ),
+            )
+            for index, role in enumerate(roles)
+        ]
+        self.num_stages = len(self.stage_configs)
+
+    def get_diffusion_od_config(self):
+        return None
+
+    async def collective_rpc(self, *, method, args=(), timeout=None, **kwargs):
+        self.calls.append({"method": method, "args": args, "timeout": timeout})
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return [self.reply]
+
+
+def test_close_operation_name_matches_the_orchestrator():
+    """The name is duplicated to keep the orchestrator out of the serving imports."""
+    from vllm_omni.engine import orchestrator
+
+    assert openpi_serving.CLOSE_COORDINATED_SESSION == orchestrator.CLOSE_COORDINATED_SESSION
+
+
+def test_a_coordinated_topology_closes_through_the_engine_control_plane():
+    engine = FakeControlPlane()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    assert serving.coordinated_session_lifecycle is True
+    serving.acquire_session("A")
+    assert asyncio.run(serving.release_session("A")) is True
+
+    assert [call["method"] for call in engine.calls] == [openpi_serving.CLOSE_COORDINATED_SESSION]
+    assert engine.calls[0]["args"] == ("A",)
+    assert engine.calls[0]["timeout"] == serving.session_close_timeout_s
+
+
+def test_a_coordinated_close_that_is_not_confirmed_raises_and_is_remembered():
+    engine = FakeControlPlane(reply={"supported": False, "error": "denoise stage unreachable"})
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    serving.acquire_session("A")
+
+    with pytest.raises(RuntimeError, match="denoise stage unreachable"):
+        asyncio.run(serving.release_session("A"))
+
+    # The unaccounted-for state is not forgotten just because the reference went.
+    assert serving.unresolved_closes == frozenset({"A"})
+    with pytest.raises(RuntimeError, match="unresolved failed close"):
+        serving.acquire_session("A")
+
+
+def test_a_coordinated_deployment_without_a_control_plane_is_an_error():
+    engine = FakeControlPlane()
+    del engine.collective_rpc
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    serving.acquire_session("A")
+
+    with pytest.raises(RuntimeError, match="no collective_rpc"):
+        asyncio.run(serving.release_session("A"))
+
+
+def test_an_uncoordinated_policy_keeps_the_local_hook_and_tolerates_no_hook():
+    closed: list[str] = []
+    engine = SimpleNamespace(
+        model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG},
+        model_runner=SimpleNamespace(
+            pipeline=SimpleNamespace(close_ar_diffusion_session=lambda session_id: closed.append(session_id))
+        ),
+    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    assert serving.coordinated_session_lifecycle is False
+    serving.acquire_session("A")
+    assert asyncio.run(serving.release_session("A")) is True
+    assert closed == ["A"]
+
+    # A stateless policy with no hook at all is still supported.
+    stateless = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+    stateless.acquire_session("B")
+    assert asyncio.run(stateless.release_session("B")) is True
+
+
+def test_a_shared_session_is_only_closed_by_its_last_holder():
+    engine = FakeControlPlane()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    serving.acquire_session("shared")
+    serving.acquire_session("shared")
+
+    assert asyncio.run(serving.release_session("shared")) is False
+    assert engine.calls == []
+
+    assert asyncio.run(serving.release_session("shared")) is True
+    assert [call["args"] for call in engine.calls] == [("shared",)]

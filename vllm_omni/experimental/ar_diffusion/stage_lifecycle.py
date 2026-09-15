@@ -154,6 +154,9 @@ class DiffusionStageLifecycleCoordinator:
         self._gate = asyncio.Lock()
         self._inflight: _InFlight | None = None
         self._blocked_reason: str | None = None
+        # Ids whose close is queued or settling; a begin for one of them would
+        # otherwise be retired by the close waiting behind it.
+        self._close_pending: set[str] = set()
 
     @property
     def live_sessions(self) -> dict[str, int]:
@@ -306,6 +309,11 @@ class DiffusionStageLifecycleCoordinator:
                     f"Coordinated session lifecycle is blocked pending recovery: {self._blocked_reason}"
                 )
             self._require_single_replica_layout()
+            if session_id in self._close_pending:
+                raise SessionLifecycleError(
+                    f"Session {session_id!r} has a close in progress; a new rollout under the same "
+                    "id cannot start until it settles, or the close would retire the new one."
+                )
             coordinated: set[str] = set()
 
             if controls.reset:
@@ -441,10 +449,34 @@ class DiffusionStageLifecycleCoordinator:
         finally:
             self._gate.release()
 
+    def request_close(self, session_id: str) -> None:
+        """Fence a session against a new begin while its close is settling.
+
+        Recorded synchronously, before the close waits on the gate: otherwise a
+        begin for the same id could take the gate first and the close behind it
+        would retire that newer rollout instead.
+        """
+        self._close_pending.add(str(session_id))
+
     async def close(self, session_id: str) -> None:
-        """Explicit close with no inference: clear participants and mark inactive."""
-        async with self._gate:
-            await self._retire_session(str(session_id), reason="explicit_close")
+        """Explicit close with no inference: clear participants and mark inactive.
+
+        Absent state is an idempotent success only while nothing about this
+        topology is unresolved; a prior cleanup failure must not be reported as a
+        clean close just because the registry entry is already gone.
+        """
+        key = str(session_id)
+        self.request_close(key)
+        try:
+            async with self._gate:
+                if self._blocked_reason is not None:
+                    raise SessionLifecycleError(
+                        f"Cannot confirm close of session {key!r} while the topology is blocked "
+                        f"pending recovery: {self._blocked_reason}"
+                    )
+                await self._retire_session(key, reason="explicit_close")
+        finally:
+            self._close_pending.discard(key)
 
     async def invalidate_all(self, *, reason: str) -> None:
         """Drop every live session and clean whatever peer state is reachable.

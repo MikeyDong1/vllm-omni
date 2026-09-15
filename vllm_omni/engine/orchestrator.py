@@ -97,6 +97,11 @@ logger = init_logger(__name__)
 # instead of stalling the orchestrator.
 _SESSION_LIFECYCLE_RPC_TIMEOUT_S = 30.0
 
+# Control operations routed through the lifecycle coordinator instead of being
+# fanned out to workers, so the live session registry is updated with them.
+CLOSE_COORDINATED_SESSION = "close_coordinated_session"
+_COORDINATED_SESSION_OPERATIONS = frozenset({CLOSE_COORDINATED_SESSION})
+
 
 def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
     for artifact_dir in artifact_dirs:
@@ -533,6 +538,8 @@ class Orchestrator:
         # Opt-in cross-stage session lifecycle, declared per stage by the
         # topology; absent for every pipeline that does not ask for it.
         self._session_lifecycle: DiffusionStageLifecycleCoordinator | None = None
+        # In-flight coordinated lifecycle operations, settled on shutdown.
+        self._session_lifecycle_tasks: set[asyncio.Task[None]] = set()
         lifecycle_topology = DiffusionStageLifecycleTopology.from_stage_configs(stage_configs or [])
         if lifecycle_topology is not None:
             self._session_lifecycle = DiffusionStageLifecycleCoordinator(
@@ -567,6 +574,68 @@ class Orchestrator:
                 )
             )
         return results
+
+    async def _drain_session_lifecycle_tasks(self) -> None:
+        """Let pending lifecycle operations answer their callers before teardown."""
+        tasks = list(self._session_lifecycle_tasks)
+        if not tasks:
+            return
+        logger.info("[Orchestrator] settling %d pending session lifecycle operation(s)", len(tasks))
+        done, pending = await asyncio.wait(tasks, timeout=_SESSION_LIFECYCLE_RPC_TIMEOUT_S)
+        del done
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _spawn_session_lifecycle_operation(
+        self,
+        rpc_id: str,
+        method: str,
+        args: tuple[Any, ...],
+        timeout: float | None,
+    ) -> None:
+        """Run one coordinated lifecycle operation and answer its correlated RPC."""
+
+        async def _run() -> None:
+            result: Any
+            try:
+                if self._session_lifecycle is None:
+                    raise SessionLifecycleError(
+                        f"{method} requires a topology that declares coordinated_session_lifecycle; "
+                        "this deployment has none, so there is no session registry to update."
+                    )
+                if not args or not isinstance(args[0], str) or not args[0].strip():
+                    raise SessionLifecycleError(f"{method} requires a non-empty session id")
+                session_id = args[0]
+                coroutine = self._session_lifecycle.close(session_id)
+                if timeout is not None:
+                    await asyncio.wait_for(coroutine, timeout=timeout)
+                else:
+                    await coroutine
+                result = True
+            except (SessionLifecycleError, TimeoutError, asyncio.TimeoutError) as exc:
+                # A timed-out close has an unknown outcome, so the coordinator's
+                # own blocked state is what gates reuse; report the failure.
+                logger.error("[Orchestrator] %s failed: %s", method, exc)
+                result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
+            except Exception as exc:  # noqa: BLE001 - one client-visible failure
+                logger.exception("[Orchestrator] %s raised", method)
+                result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
+            await self.rpc_async_queue.put(
+                CollectiveRPCResultMessage(
+                    rpc_id=rpc_id,
+                    method=method,
+                    stage_ids=list(self._session_lifecycle.topology.stage_ids)
+                    if self._session_lifecycle is not None
+                    else [],
+                    results=[result],
+                )
+            )
+
+        task = asyncio.create_task(_run(), name=f"orchestrator-session-lifecycle-{rpc_id}")
+        self._session_lifecycle_tasks.add(task)
+        task.add_done_callback(self._session_lifecycle_tasks.discard)
 
     async def _admit_session_lifecycle(
         self,
@@ -771,6 +840,8 @@ class Orchestrator:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+            await self._drain_session_lifecycle_tasks()
+
             if self.duplex_control_plane is not None:
                 await self.duplex_control_plane.shutdown()
 
@@ -1157,6 +1228,14 @@ class Orchestrator:
         args = tuple(msg.args)
         kwargs = dict(msg.kwargs or {})
         requested_stage_ids = msg.stage_ids
+
+        if method in _COORDINATED_SESSION_OPERATIONS:
+            # Not a worker fan-out: it has to go through the coordinator so the
+            # live registry is updated too. It also has to wait on the admission
+            # gate, so it runs as tracked work rather than parking the control
+            # loop that output routing and aborts depend on.
+            self._spawn_session_lifecycle_operation(rpc_id, method, args, timeout)
+            return
 
         target_pools: list[StagePool] = []
         if requested_stage_ids is None:

@@ -540,6 +540,8 @@ class Orchestrator:
         self._session_lifecycle: DiffusionStageLifecycleCoordinator | None = None
         # In-flight coordinated lifecycle operations, settled on shutdown.
         self._session_lifecycle_tasks: set[asyncio.Task[None]] = set()
+        # Terminal outputs held back until their lifecycle settles.
+        self._deferred_terminals: dict[str, OutputMessage] = {}
         lifecycle_topology = DiffusionStageLifecycleTopology.from_stage_configs(stage_configs or [])
         if lifecycle_topology is not None:
             self._session_lifecycle = DiffusionStageLifecycleCoordinator(
@@ -683,25 +685,83 @@ class Orchestrator:
         )
         return True
 
-    async def _complete_session_lifecycle(self, request_ids: Sequence[str], *, success: bool) -> None:
-        """Close out coordinated lifecycle for finished ids and reopen admission.
+    async def _flush_deferred_terminals(self) -> None:
+        """Publish any terminal held at shutdown so no caller waits forever."""
+        stranded = list(self._deferred_terminals.items())
+        self._deferred_terminals.clear()
+        for request_id, msg in stranded:
+            logger.warning(
+                "[Orchestrator] req=%s: publishing a terminal held for lifecycle settlement at shutdown",
+                request_id,
+            )
+            await self.output_async_queue.put(msg)
 
-        A failure here already blocked further admission inside the coordinator,
-        so it is reported rather than raised: letting it escape would abort an
-        orchestrator teardown path.
+    async def _emit_output(self, msg: OutputMessage) -> None:
+        """Publish one stage output, holding back a coordinated terminal.
+
+        A coordinated topology must not tell the client the rollout finished
+        before the cross-stage cleanup that finish implies has been confirmed, so
+        the terminal message waits for ``_complete_session_lifecycle`` to settle
+        it. Every other output, and every other pipeline, is unaffected.
+        """
+        coordinator = self._session_lifecycle
+        req_state = self.request_states.get(msg.request_id) if msg.request_id is not None else None
+        if (
+            coordinator is not None
+            and getattr(msg, "finished", False)
+            and msg.request_id is not None
+            and coordinator.is_inflight(msg.request_id)
+            and msg.request_id not in self._deferred_terminals
+            # A duplex session's outputs are not followed by request cleanup, so
+            # a deferral there would never be published.
+            and not (req_state is not None and self._is_duplex_session_request(req_state))
+        ):
+            self._deferred_terminals[msg.request_id] = msg
+            return
+        await self.output_async_queue.put(msg)
+
+    async def _complete_session_lifecycle(self, request_ids: Sequence[str], *, success: bool) -> None:
+        """Settle coordinated lifecycle, publish the outcome, reopen admission.
+
+        Exactly one terminal message reaches the client per request: the deferred
+        success when the topology synchronized, or one lifecycle error instead of
+        it when it did not. A request whose inference already failed has had its
+        error published, so a cleanup failure is logged rather than sent twice.
         """
         coordinator = self._session_lifecycle
         if coordinator is None:
             return
         for request_id in request_ids:
+            if not coordinator.is_inflight(request_id):
+                # Already settled: no duplicate finalization or second terminal.
+                continue
             try:
-                await coordinator.complete(request_id, success=success)
+                await coordinator.settle(request_id, success=success)
             except SessionLifecycleError as exc:
+                deferred = self._deferred_terminals.pop(request_id, None)
                 logger.error(
                     "[Orchestrator] req=%s: coordinated session cleanup failed; blocking reuse: %s",
                     request_id,
                     exc,
                 )
+                if deferred is not None:
+                    # The actions were produced, but the close they imply did not
+                    # happen, so this is not a success.
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=request_id,
+                            stage_id=deferred.stage_id,
+                            error=str(exc),
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                            error_type="session_lifecycle_error",
+                        )
+                    )
+            else:
+                deferred = self._deferred_terminals.pop(request_id, None)
+                if deferred is not None:
+                    await self.output_async_queue.put(deferred)
+            finally:
+                await coordinator.release_admission(request_id)
 
     def _init_metrics_state(
         self,
@@ -841,6 +901,7 @@ class Orchestrator:
             except Exception:
                 pass
             await self._drain_session_lifecycle_tasks()
+            await self._flush_deferred_terminals()
 
             if self.duplex_control_plane is not None:
                 await self.duplex_control_plane.shutdown()
@@ -2116,7 +2177,7 @@ class Orchestrator:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
-            await self.output_async_queue.put(
+            await self._emit_output(
                 OutputMessage(
                     request_id=request_id,
                     stage_id=stage_id,
@@ -2211,7 +2272,7 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
-            await self.output_async_queue.put(
+            await self._emit_output(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=stage_id,
@@ -2473,7 +2534,7 @@ class Orchestrator:
             ),
             decision,
         )
-        await self.output_async_queue.put(
+        await self._emit_output(
             OutputMessage(
                 request_id=req_id,
                 stage_id=stage_id,
@@ -2803,7 +2864,7 @@ class Orchestrator:
                         src_stage_id,
                         next_logical,
                     )
-                    await self.output_async_queue.put(
+                    await self._emit_output(
                         OutputMessage(
                             request_id=req_id,
                             stage_id=next_logical,
@@ -2829,6 +2890,8 @@ class Orchestrator:
                             src_stage_id,
                             next_logical,
                         )
+                        # Published directly: this terminal carries the error
+                        # itself, so it must not wait on lifecycle settlement.
                         await self.output_async_queue.put(
                             OutputMessage(
                                 request_id=req_id,
@@ -3017,7 +3080,7 @@ class Orchestrator:
                 final_output_type or "text",
                 final_stage_id,
             )
-            await self.output_async_queue.put(
+            await self._emit_output(
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,

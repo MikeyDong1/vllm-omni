@@ -915,3 +915,132 @@ def test_cancellation_during_registration_leaves_no_orphan_and_frees_the_gate():
 
     asyncio.run(scenario())
     assert coordinator.is_active("B")
+
+
+# -- terminal ordering: settle before publishing ----------------------------
+
+
+def test_settle_keeps_the_gate_until_admission_is_released():
+    """The next generation must not start while this outcome is undecided."""
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    order: list[str] = []
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        workers[DENOISE].touch_session("A")
+        await coordinator.settle("r0", success=True)
+        order.append("settled")
+
+        async def second():
+            await coordinator.admit("r1", SessionControls("B", reset=True))
+            order.append("r1-admitted")
+            await coordinator.complete("r1", success=True)
+
+        task = asyncio.create_task(second())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Settled but not released: nobody else got in.
+        order.append("still-gated")
+        await coordinator.release_admission("r0")
+        await task
+
+    asyncio.run(scenario())
+
+    assert order == ["settled", "still-gated", "r1-admitted"]
+
+
+def test_settle_raises_so_a_caller_can_withhold_a_terminal_success():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True, close_session=True))
+        workers[ENCODE].touch_session("A")
+        workers[DENOISE].touch_session("A")
+        workers[ENCODE].fail_close.add("A")
+        with pytest.raises(SessionLifecycleError):
+            await coordinator.settle("r0", success=True)
+        # Still gated after a failed settle, so nothing races the failure.
+        assert coordinator.is_inflight("r0")
+        await coordinator.release_admission("r0")
+
+    asyncio.run(scenario())
+    assert coordinator.blocked_reason is not None
+
+
+def test_settling_the_same_request_twice_is_a_no_op():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        workers[DENOISE].touch_session("A")
+        await coordinator.settle("r0", success=True)
+        await coordinator.release_admission("r0")
+        # Re-entering cleanup for the same id does nothing and does not double
+        # release the gate.
+        await coordinator.settle("r0", success=True)
+        await coordinator.release_admission("r0")
+        assert not coordinator.is_inflight("r0")
+        await coordinator.admit("r1", SessionControls("A"))
+        await coordinator.complete("r1", success=True)
+
+    asyncio.run(scenario())
+    assert coordinator.is_active("A")
+
+
+def test_is_inflight_tracks_only_the_admitted_request():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+
+    async def scenario():
+        assert coordinator.is_inflight("r0") is False
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        assert coordinator.is_inflight("r0") is True
+        assert coordinator.is_inflight("r1") is False
+        await coordinator.complete("r0", success=True)
+        assert coordinator.is_inflight("r0") is False
+
+    asyncio.run(scenario())
+
+
+def test_a_close_cannot_be_confirmed_while_the_topology_is_blocked():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    asyncio.run(_run_request(coordinator, workers, "r1", "B", reset=True))
+    workers[ENCODE].fail_close.add("A")
+
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.close("A"))
+    assert coordinator.blocked_reason is not None
+
+    # A later close of an absent session is not a clean success while unresolved.
+    with pytest.raises(SessionLifecycleError, match="blocked pending recovery"):
+        asyncio.run(coordinator.close("B"))
+
+
+def test_a_begin_is_refused_while_the_same_id_is_being_closed():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+
+    async def scenario():
+        # The close is requested and parked behind the gate that admit holds.
+        await coordinator.admit("r1", SessionControls("A"))
+        close_task = asyncio.create_task(coordinator.close("A"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await coordinator.complete("r1", success=True)
+        await close_task
+
+    asyncio.run(scenario())
+    assert not coordinator.is_active("A")
+
+    # And a begin while a close is pending is refused outright.
+    coordinator.request_close("C")
+    with pytest.raises(SessionLifecycleError, match="close in progress"):
+        asyncio.run(coordinator.admit("r2", SessionControls("C", reset=True)))

@@ -410,44 +410,64 @@ class DiffusionStageLifecycleCoordinator:
         )
         logger.info("Coordinated session %s retired across the topology (%s)", session_id, reason)
 
-    async def complete(self, request_id: str, *, success: bool) -> None:
-        """Close out one admitted request, then let the next one in.
+    def is_inflight(self, request_id: str) -> bool:
+        """Whether this request currently holds the topology's admission slot."""
+        return self._inflight is not None and self._inflight.request_id == str(request_id)
+
+    async def settle(self, request_id: str, *, success: bool) -> None:
+        """Finish one request's cross-stage lifecycle, keeping the gate held.
 
         Runs for a returned error and a raised exception alike; either path can
-        leave release events that must drain before the state is reused.
+        leave release events that must drain before the state is reused. Raises
+        when the topology could not be synchronized, so the caller can withhold a
+        terminal success it has not earned. The gate stays held until
+        ``release_admission``, so no other generation starts while the outcome of
+        this one is still being decided.
         """
         inflight = self._inflight
         if inflight is None or inflight.request_id != str(request_id):
-            # Already completed, or never admitted; nothing holds the gate.
+            # Already settled, or never admitted.
             return
-        self._inflight = None
+        failures: list[str] = []
         try:
-            failures: list[str] = []
+            await self._drain_release_events(inflight)
+        except SessionLifecycleError as exc:
+            failures.append(str(exc))
+
+        if not success:
+            # The generation is invalid everywhere; never retried as a
+            # continuation.
             try:
-                await self._drain_release_events(inflight)
+                await self._retire_session(inflight.session_id, reason="request_failure")
+            except SessionLifecycleError as exc:
+                failures.append(str(exc))
+        elif inflight.close_session and inflight.session_id in self._live:
+            try:
+                await self._retire_session(inflight.session_id, reason="explicit_close")
             except SessionLifecycleError as exc:
                 failures.append(str(exc))
 
-            if not success:
-                # The generation is invalid everywhere; never retried as a
-                # continuation.
-                try:
-                    await self._retire_session(inflight.session_id, reason="request_failure")
-                except SessionLifecycleError as exc:
-                    failures.append(str(exc))
-            elif inflight.close_session and inflight.session_id in self._live:
-                try:
-                    await self._retire_session(inflight.session_id, reason="explicit_close")
-                except SessionLifecycleError as exc:
-                    failures.append(str(exc))
+        if failures:
+            # Block reuse rather than report a synchronization we did not achieve.
+            self._blocked_reason = "; ".join(failures)
+            raise SessionLifecycleError(self._blocked_reason)
 
-            if failures:
-                # Block reuse rather than report a synchronization we did not
-                # achieve.
-                self._blocked_reason = "; ".join(failures)
-                raise SessionLifecycleError(self._blocked_reason)
+    async def release_admission(self, request_id: str) -> None:
+        """Let the next topology request in, once this one's outcome is published."""
+        if self._inflight is None or self._inflight.request_id != str(request_id):
+            return
+        self._inflight = None
+        self._gate.release()
+
+    async def complete(self, request_id: str, *, success: bool) -> None:
+        """Settle one request and immediately reopen admission.
+
+        For callers with no terminal output to publish between the two steps.
+        """
+        try:
+            await self.settle(request_id, success=success)
         finally:
-            self._gate.release()
+            await self.release_admission(request_id)
 
     def request_close(self, session_id: str) -> None:
         """Fence a session against a new begin while its close is settling.
@@ -474,7 +494,14 @@ class DiffusionStageLifecycleCoordinator:
                         f"Cannot confirm close of session {key!r} while the topology is blocked "
                         f"pending recovery: {self._blocked_reason}"
                     )
-                await self._retire_session(key, reason="explicit_close")
+                try:
+                    await self._retire_session(key, reason="explicit_close")
+                except SessionLifecycleError as exc:
+                    # The registry entry is gone but its remote state is not
+                    # accounted for. Record that, or the next close of this now
+                    # absent session would look like a clean one.
+                    self._blocked_reason = f"close of session {key!r} was not confirmed: {exc}"
+                    raise
         finally:
             self._close_pending.discard(key)
 

@@ -563,8 +563,24 @@ class ServingRealtimeRobotOpenPI:
                 "reach no encoder. Declare a stage with stage_role 'full' or 'encode'."
             )
 
+    @staticmethod
+    def _raise_engine_error(result: Any) -> None:
+        """Surface an engine-reported failure before reading actions off it.
+
+        A lifecycle cleanup failure arrives as an error on the final output; the
+        actionable message must reach the client instead of being replaced by a
+        "Missing actions" complaint about the empty payload it came with.
+        """
+        error = getattr(result, "error", None)
+        if not error:
+            return
+        error_type = getattr(result, "error_type", None)
+        detail = f"{error_type}: {error}" if error_type else str(error)
+        raise RuntimeError(f"Robot OpenPI request failed: {detail}")
+
     def _extract_actions(self, result: Any) -> ActionOutput:
         """Extract actions from engine result."""
+        self._raise_engine_error(result)
         multimodal_output = getattr(result, "multimodal_output", None)
         if not isinstance(multimodal_output, Mapping):
             raise RuntimeError("Missing multimodal_output in robot policy result")

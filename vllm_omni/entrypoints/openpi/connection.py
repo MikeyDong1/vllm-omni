@@ -189,13 +189,10 @@ class RobotRealtimeConnection:
     async def reset(self) -> None:
         """Release the sessions this connection owns and forget its bookkeeping.
 
-        Raises when a release could not be confirmed, so the caller does not
-        acknowledge a reset that left model state behind.
-
-        A session another connection still holds is deliberately left alone and
-        keeps its seen-marker: releasing it would end their rollout, and
-        forgetting it would make this connection's next observation carry
-        ``reset``, restarting the rollout underneath them.
+        Raises when a release is unconfirmed, so the caller does not acknowledge a
+        reset that left state behind. A session another connection still holds is
+        left alone and keeps its seen-marker: releasing it would end their
+        rollout, and forgetting it would make the next observation carry ``reset``.
         """
         shared: list[str] = []
         for session_id in sorted(self._held_sessions):
@@ -216,8 +213,8 @@ class RobotRealtimeConnection:
     async def _release_held_sessions(self) -> None:
         """Release every held session, continuing past a failure.
 
-        Used on disconnect, where there is no client left to acknowledge: one
-        failed release must not skip the others.
+        On disconnect there is no client left to tell, and one failed release
+        must not skip the others.
         """
         for session_id in sorted(self._held_sessions):
             await self._release_session(session_id)
@@ -225,8 +222,7 @@ class RobotRealtimeConnection:
     async def _release_session(self, session_id: str, *, propagate: bool = False) -> None:
         """Drop this connection's hold on ``session_id``.
 
-        ``propagate`` re-raises the failure for callers that owe the client an
-        acknowledgement; otherwise it is logged and the caller moves on.
+        ``propagate`` re-raises for callers that owe the client an acknowledgement.
         """
         if session_id not in self._held_sessions:
             return
@@ -251,8 +247,8 @@ class RobotRealtimeConnection:
             self._seen_sessions.move_to_end(session_id)
             return False
 
-        # Acquire first: a refused id (closing, or with an unresolved failed
-        # close) must not leave this connection believing it holds one.
+        # Acquire first: a refused id must not leave this connection believing
+        # it holds one.
         self.serving.acquire_session(session_id)
         self._seen_sessions[session_id] = None
         self._held_sessions.add(session_id)
@@ -325,9 +321,8 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
-                        # Acknowledge only after the releases are confirmed: a
-                        # "reset successful" over unreleased worker state is the
-                        # bug this endpoint used to have.
+                        # Only after the releases are confirmed: this endpoint
+                        # used to answer over unreleased worker state.
                         try:
                             await self.reset()
                         except Exception:

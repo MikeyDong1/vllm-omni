@@ -868,10 +868,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return bool(extra_args.get("reset", False))
 
     def register_session_generation(self, session_id: str, generation: int) -> bool:
-        """Bind the coordinator-issued generation this stage should now accept.
-
-        Identity only, so the weightless postprocess stage gains no tensors.
-        """
+        """Bind the generation this stage accepts; identity only, no tensors."""
         key = str(session_id or "default")
         generations = getattr(self, "_session_generations", None)
         if generations is None:
@@ -2358,11 +2355,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     def _authorize_generation(self, enc: _DreamZeroEncoded) -> None:
         """Reject a payload that does not belong to this stage's live rollout.
 
-        On a coordinated topology the generation is mandatory: a missing or zero
-        one means the coordinator never registered this rollout here, which is
-        exactly the state a stale or unrouted payload arrives in. Warmup rollouts
-        this pipeline generated itself, and uncoordinated single-stage runs, are
-        the only exemptions.
+        A coordinated topology makes the generation mandatory: a missing one is
+        the state a stale or misrouted payload arrives in. Only this pipeline's
+        own warmup rollouts and uncoordinated runs are exempt.
         """
         registered = self.registered_session_generation(enc.session_id)
         coordinated = bool(getattr(self, "_lifecycle_coordinated", False))

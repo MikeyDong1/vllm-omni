@@ -244,9 +244,8 @@ class ServingRealtimeRobotOpenPI:
     def acquire_session(self, session_id: str) -> None:
         """Record that one more connection is using ``session_id``.
 
-        Refused while that id is being torn down or has an unresolved failed
-        close: acquiring it would attach a new rollout to state that is about to
-        be destroyed, or that nothing has confirmed is gone.
+        Refused while that id is closing or has an unresolved failed close:
+        either way nothing has confirmed its old state is gone.
         """
         key = str(session_id)
         if key in self._closing_sessions:
@@ -284,9 +283,8 @@ class ServingRealtimeRobotOpenPI:
             )
             return False
         self._session_refcounts.pop(key, None)
-        # Marked while the close runs so a concurrent acquire cannot take the id,
-        # and recorded on failure so the unaccounted-for state is not forgotten
-        # just because the last connection's reference is gone.
+        # Marked so a concurrent acquire cannot take the id, and recorded on
+        # failure so unaccounted-for state outlives the last reference.
         self._closing_sessions.add(key)
         try:
             await self.close_session(key)
@@ -303,10 +301,9 @@ class ServingRealtimeRobotOpenPI:
     async def close_session(self, session_id: str) -> None:
         """Release model-side session state for ``session_id``.
 
-        A coordinated topology has its state in worker processes the serving layer
-        cannot touch, so the close goes through the engine's control plane and is
-        only reported done once the coordinator has retired every participant. An
-        in-process client keeps the direct pipeline hook.
+        A coordinated topology keeps its state in worker processes, so the close
+        goes through the engine's control plane and is reported done only once
+        every participant is retired. An in-process client keeps the local hook.
         """
         if self.coordinated_session_lifecycle:
             await self._close_remote_session(session_id)
@@ -336,9 +333,9 @@ class ServingRealtimeRobotOpenPI:
     def drop_session(self, session_id: str) -> Any:
         """Best-effort release of model-side session state for an in-process client.
 
-        Returns the hook's result so ``close_session`` can await an async hook. A
-        model with no per-session state legitimately has no hook; a coordinated
-        deployment never reaches here.
+        Returns the hook's result so ``close_session`` can await an async one. A
+        model with no per-session state has no hook, and a coordinated deployment
+        never reaches here.
         """
         drop = getattr(self.engine_client, "drop_session", None)
         if callable(drop):
@@ -569,9 +566,9 @@ class ServingRealtimeRobotOpenPI:
     def _raise_engine_error(result: Any) -> None:
         """Surface an engine-reported failure before reading actions off it.
 
-        A lifecycle cleanup failure arrives as an error on the final output; the
-        actionable message must reach the client instead of being replaced by a
-        "Missing actions" complaint about the empty payload it came with.
+        A lifecycle failure arrives as an error on the final output; its message
+        must reach the client rather than a "Missing actions" complaint about the
+        empty payload it came with.
         """
         error = getattr(result, "error", None)
         if not error:

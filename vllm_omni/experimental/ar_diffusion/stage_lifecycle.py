@@ -230,9 +230,8 @@ class DiffusionStageLifecycleCoordinator:
     def _collect_support(value: Any, *, errors: list[str], supported: list[bool]) -> None:
         """Flatten per-replica/per-rank results into support and error lists.
 
-        Only ``True`` counts as an acknowledgement. ``False``, ``None``, an empty
-        reply and an unrecognized shape are all failures: a lifecycle operation
-        that cannot be confirmed has not happened.
+        Only ``True`` acknowledges. ``False``, ``None``, an empty reply and an
+        unrecognized shape are failures: an unconfirmed operation has not happened.
         """
         if isinstance(value, bool):
             supported.append(value)
@@ -305,9 +304,8 @@ class DiffusionStageLifecycleCoordinator:
     async def _evict_oldest_if_needed(self) -> None:
         """Keep the registry bounded, retiring the oldest through the fan-out.
 
-        A victim's history is released irreversibly, so it is never resurrected in
-        the registry. If its cleanup cannot be confirmed, block reuse instead of
-        leaving a stage holding state nothing tracks.
+        A victim's history is gone irreversibly, so it is never resurrected; an
+        unconfirmed cleanup blocks reuse.
         """
         while len(self._live) > self._max_live_sessions:
             victim, generation = next(iter(self._live.items()))
@@ -328,8 +326,8 @@ class DiffusionStageLifecycleCoordinator:
         """
         await self._gate.acquire()
         session_id = str(controls.session_id)
-        # Nothing is published until every registration acknowledges, so a failed
-        # admission cannot leave a half-registered session continuable.
+        # Published only once every registration acknowledges, so a failed
+        # admission leaves nothing continuable.
         candidate: int | None = None
         committed = False
         try:
@@ -346,17 +344,14 @@ class DiffusionStageLifecycleCoordinator:
             coordinated: set[str] = set()
 
             if controls.reset:
-                # Phase one: retire the old generation. The gate already drained
-                # older work, and this fans out once so no downstream stage
-                # repeats it. A failure or cancellation here fences the id through
-                # the shared retirement path -- there is no candidate yet to roll
-                # back, and the old session is never restored, because a peer that
-                # did succeed has already discarded its history.
+                # Phase one: retire the old generation, once, so no
+                # downstream stage repeats it. A failure here fences the topology
+                # and the old session is not restored -- a peer that did succeed
+                # has already discarded its history.
                 if session_id in self._live:
                     await self._retire_session(session_id, reason="coordinated_reset")
                     coordinated.add(session_id)
-                # Phase two: allocate a candidate. Monotonic, so recovery may skip
-                # numbers but never reuses one.
+                # Phase two: allocate a candidate; monotonic, never reused.
                 self._next_generation += 1
                 candidate = self._next_generation
             else:
@@ -415,8 +410,8 @@ class DiffusionStageLifecycleCoordinator:
     async def _rollback_candidate(self, session_id: str, generation: int) -> None:
         """Undo a failed admission, or block reuse when it cannot be confirmed.
 
-        The generation counter is never rewound: a consumed id stays consumed, so
-        a retried begin cannot collide with state a participant already took.
+        The counter is never rewound, so a retried begin cannot collide with state
+        a participant already took.
         """
         try:
             await self._retire_session(session_id, reason="admission_rollback")
@@ -432,11 +427,10 @@ class DiffusionStageLifecycleCoordinator:
     async def _retire_session(self, session_id: str, *, reason: str) -> None:
         """Clear a session on every participant, fencing the id unless confirmed.
 
-        The single retirement path for explicit close, reset, request failure,
-        rollback and registry eviction, so no caller can leave an untracked
-        partial cleanup behind. A cancelled await does not prove the remote
-        cleanup stopped, so cancellation is recorded as unresolved before it is
-        allowed to propagate.
+        The one retirement path for explicit close, reset, request failure,
+        rollback and registry eviction, so no caller leaves an untracked partial
+        cleanup. A cancelled await does not prove the remote cleanup stopped, so
+        cancellation is recorded before it propagates.
         """
         key = str(session_id)
         record = _PendingRetirement(
@@ -490,12 +484,11 @@ class DiffusionStageLifecycleCoordinator:
     async def settle(self, request_id: str, *, success: bool) -> None:
         """Finish one request's cross-stage lifecycle, keeping the gate held.
 
-        Runs for a returned error and a raised exception alike; either path can
-        leave release events that must drain before the state is reused. Raises
-        when the topology could not be synchronized, so the caller can withhold a
-        terminal success it has not earned. The gate stays held until
-        ``release_admission``, so no other generation starts while the outcome of
-        this one is still being decided.
+        Runs for a returned error and a raised exception alike; either can leave
+        release events that must drain first. Raises when the topology could not
+        be synchronized, so the caller can withhold a success it has not earned.
+        The gate is held until ``release_admission``, so nothing starts while this
+        outcome is undecided.
         """
         inflight = self._inflight
         if inflight is None or inflight.request_id != str(request_id):
@@ -545,10 +538,9 @@ class DiffusionStageLifecycleCoordinator:
     def request_close(self, session_id: str) -> None:
         """Fence a session against a new begin while its close is settling.
 
-        Recorded synchronously, before the close waits on the gate: otherwise a
-        begin for the same id could take the gate first and the close behind it
-        would retire that newer rollout instead. Counted, so two concurrent
-        closes for one id each hold their own share of the fence.
+        Recorded before the close waits on the gate: otherwise a begin could take
+        the gate first and the close behind it would retire that newer rollout.
+        Counted, so concurrent closes each hold their own share.
         """
         self._close_pending[str(session_id)] += 1
 
@@ -572,8 +564,8 @@ class DiffusionStageLifecycleCoordinator:
         self.request_close(key)
         gate_held = False
         try:
-            # Cancellation while queued behind the gate has dispatched nothing, so
-            # it leaves no unresolved record; only the fence share is returned.
+            # Cancellation while queued dispatched nothing, so only the fence
+            # share is returned.
             await self._gate.acquire()
             gate_held = True
             if self._blocked_reason is not None:
@@ -690,11 +682,10 @@ class DiffusionStageLifecycleCoordinator:
     def _validate_ack_counts(self, results: Mapping[int, Any], *, expected: int) -> list[str]:
         """Check that every stage answered the acknowledgement.
 
-        A count below ``expected`` is not a failure: acknowledgement has to be
-        idempotent, because a retry after a partially failed ack re-sends ids some
-        ranks have already dropped. What must not pass is an error, an unsupported
-        participant or a reply nobody answered -- those leave the events pending on
-        the worker, and assuming otherwise would lose or replay them.
+        A count below ``expected`` is fine: acks must be idempotent, since a retry
+        re-sends ids some ranks already dropped. An error, an unsupported
+        participant or an unanswered reply leaves the events pending on the
+        worker, so those are failures.
         """
         failures: list[str] = []
         for stage_id, value in results.items():

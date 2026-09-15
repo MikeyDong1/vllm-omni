@@ -631,14 +631,12 @@ class Orchestrator:
                     await coroutine
                 result = True
             except (SessionLifecycleError, TimeoutError, asyncio.TimeoutError) as exc:
-                # A timed-out close has an unknown outcome. The coordinator has
-                # already fenced the session id, so reuse stays blocked; the
-                # caller gets the failure rather than its own timeout.
+                # A timed-out close has an unknown outcome; the coordinator has
+                # already fenced it, so the caller gets the failure.
                 logger.error("[Orchestrator] %s failed: %s", method, exc)
                 result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
             except asyncio.CancelledError as exc:
-                # Shutdown cancelled this operation. Answer the caller instead of
-                # leaving it to wait, then let the cancellation propagate.
+                # Shutdown cancelled it; answer the caller before propagating.
                 cancelled = exc
                 result = {
                     "supported": False,
@@ -714,17 +712,15 @@ class Orchestrator:
     async def _finalize_deferred_terminals(self) -> None:
         """Decide every held terminal at shutdown, so no caller waits forever.
 
-        A terminal was held precisely because its lifecycle settlement had not
-        been confirmed, so publishing it unchanged would defeat the ordering it
-        was waiting for. Only a settlement that actually succeeded is published;
-        anything else becomes one terminal lifecycle error. Idempotent, because
-        each entry is removed as part of its single finalization decision.
+        Publishing an unsettled terminal unchanged would defeat the ordering it
+        was held for, so only a confirmed settlement is published and anything
+        else becomes one lifecycle error. Idempotent: each entry is removed as
+        part of its single decision.
         """
         while self._deferred_terminals:
             request_id, deferred = self._deferred_terminals.popitem()
             if deferred.settled:
-                # Settlement was confirmed and only its publication was
-                # interrupted, so the success is real.
+                # Confirmed; only its publication was interrupted.
                 logger.info(
                     "[Orchestrator] req=%s: publishing a settled terminal held at shutdown",
                     request_id,
@@ -763,9 +759,7 @@ class Orchestrator:
             await self.output_async_queue.put(msg)
             return
         if request_id in self._deferred_terminals:
-            # A second terminal while the first is still pending must not reach
-            # the client early; it would bypass the settlement the first is
-            # waiting for.
+            # A second terminal would bypass the settlement the first awaits.
             logger.warning(
                 "[Orchestrator] req=%s: dropping a duplicate terminal while its outcome is pending",
                 request_id,
@@ -806,10 +800,8 @@ class Orchestrator:
                     exc,
                 )
                 if deferred is not None:
-                    # The actions were produced, but the close they imply did not
-                    # happen, so this is not a success. The primary error of an
-                    # already-failed request was published by the error path, so
-                    # there is nothing deferred for it and nothing sent twice.
+                    # The actions were produced but the close they imply was
+                    # not, so this is not a success.
                     await self.output_async_queue.put(
                         ErrorMessage(
                             request_id=request_id,
@@ -822,7 +814,7 @@ class Orchestrator:
             else:
                 deferred = self._deferred_terminals.get(request_id)
                 if deferred is not None:
-                    # Marked before the publish so an interrupted publication is
+                    # Marked before publishing, so an interrupted publication is
                     # finalized as the confirmed success it already is.
                     deferred.settled = True
                     await self.output_async_queue.put(deferred.message)
@@ -1361,10 +1353,9 @@ class Orchestrator:
         requested_stage_ids = msg.stage_ids
 
         if method in _COORDINATED_SESSION_OPERATIONS:
-            # Not a worker fan-out: it has to go through the coordinator so the
-            # live registry is updated too. It also has to wait on the admission
-            # gate, so it runs as tracked work rather than parking the control
-            # loop that output routing and aborts depend on.
+            # Through the coordinator, not a worker fan-out, so the live
+            # registry is updated too. Tracked rather than awaited here: it waits
+            # on the admission gate, and this loop also carries output routing.
             self._spawn_session_lifecycle_operation(rpc_id, method, args, timeout)
             return
 

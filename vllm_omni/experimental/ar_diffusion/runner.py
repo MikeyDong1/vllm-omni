@@ -225,8 +225,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # Record before raising: peers must learn this stage dropped the session
         # even when local cleanup only partly succeeded.
         self.release_events.record(session_id, reason=reason, cleanup_failed=bool(errors))
-        # The event above captured the generation, so the binding can go; keeping
-        # one per session id ever seen would grow without bound.
+        # The event captured it, and one binding per id ever seen would grow
+        # without bound.
         self.release_events.forget_generation(session_id)
         if errors:
             if suppress_errors:
@@ -263,10 +263,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def register_ar_diffusion_generation(self, session_id: str, generation: int) -> bool:
         """Bind one generation to both the release log and the loaded model.
 
-        The runner owns registration for a stage that has one: reporting only to
-        its own event log would leave the model unable to fence a stale payload.
-        A model that does not implement the hook cannot be fenced, so on a
-        coordinated topology that is a failure rather than a silent success.
+        Reporting only to the event log would leave the model unable to fence a
+        stale payload. A model without the hook cannot be fenced at all, which on
+        a coordinated topology is a failure rather than a silent success.
         """
         pipeline = getattr(self, "pipeline", None)
         register = getattr(pipeline, "register_session_generation", None)
@@ -284,8 +283,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 f"{type(pipeline).__name__}.register_session_generation() refused generation "
                 f"{generation} for session {session_id!r}."
             )
-        # Only after the model accepted it, so a failed registration cannot leave
-        # the log stamping releases with a generation the model never took.
+        # After the model accepted it, so a failed registration cannot leave the
+        # log stamping a generation the model never took.
         self.release_events.register_generation(session_id, generation)
         return True
 
@@ -296,10 +295,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def _reject_unknown_continuation(self, session_id: str, *, reset: bool) -> None:
         """Refuse a continuation of a session this runner no longer holds.
 
-        Otherwise ``_get_or_create_session`` evicts a healthy session to make
-        room for the unknown one, and only then does the pipeline reject the
-        request. Opt-in, since only a coordinated topology can rely on the
-        coordinator having already retired what it released.
+        Otherwise ``_get_or_create_session`` evicts a healthy session to make room
+        for the unknown one, and only then does the pipeline reject it. Opt-in:
+        only a coordinated topology can rely on the coordinator's retirements.
         """
         if reset or not self.lifecycle_externally_coordinated:
             return

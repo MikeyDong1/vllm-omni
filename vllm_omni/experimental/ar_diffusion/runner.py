@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -25,6 +25,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.release_events import ARDiffusionReleaseEventLog
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -71,6 +72,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
         # modes instead of one entry per denoise step.
         self._stepwise_chunk_started: dict[str, float] = {}
+        # A stage in a coordinated topology reports releases upward and lets the
+        # orchestrator own reset/close ordering; a single-stage deployment keeps
+        # performing its own request-driven cleanup.
+        self.lifecycle_externally_coordinated = bool(getattr(od_config, "coordinated_session_lifecycle", False))
+        stage_id = getattr(od_config, "stage_id", None)
+        self.release_events = ARDiffusionReleaseEventLog(
+            stage_id=-1 if stage_id is None else int(stage_id),
+        )
 
     @staticmethod
     def _require_capability(pipeline: object) -> SupportsARDiffusionPipeline:
@@ -91,6 +100,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._preallocate_kv_cache()
         if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
             self._warmup_ar_rollout()
+        # Warmup drives real rollouts and releases them again; those are not
+        # user sessions, so start reporting releases only once it is done.
+        self.release_events.set_ready()
 
     def _available_memory_bytes(self) -> int:
         if self.device is None or torch.device(self.device).type != "cuda":
@@ -208,6 +220,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
                 errors.append(exc)
         logger.debug("AR-Diffusion released session=%s reason=%s", session_id, reason)
+        # Record before raising: peers must learn that this stage dropped the
+        # session even when local cleanup only partly succeeded.
+        self.release_events.record(session_id, reason=reason, cleanup_failed=bool(errors))
         if errors:
             if suppress_errors:
                 logger.warning(
@@ -227,6 +242,29 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def close_session(self, session_id: str) -> None:
         """Release KV and notify the pipeline to drop model-owned state."""
         self._release_session(session_id, reset_model=False, reason="close")
+
+    # -- coordinated lifecycle surface (collective RPC) ---------------------
+
+    def suppress_release_events(self, session_id: str):
+        """Context manager marking a release as coordinator-driven."""
+        return self.release_events.coordinated(session_id)
+
+    def get_ar_diffusion_release_events(self) -> list[dict[str, object]]:
+        """Report self-initiated releases without consuming them."""
+        return self.release_events.pending()
+
+    def ack_ar_diffusion_release_events(self, event_ids: Sequence[str]) -> int:
+        """Drop release records the coordinator has finished acting on."""
+        return self.release_events.acknowledge(event_ids)
+
+    def register_ar_diffusion_generation(self, session_id: str, generation: int) -> bool:
+        """Stamp the generation this stage's releases should be reported under."""
+        self.release_events.register_generation(session_id, generation)
+        return True
+
+    def has_ar_diffusion_session(self, session_id: str) -> bool:
+        """Whether runner-owned KV for ``session_id`` is currently resident."""
+        return str(session_id) in self._sessions
 
     def _get_or_create_session(self, session_id: str) -> ARDiffusionKVState:
         state = self._sessions.get(session_id)
@@ -318,13 +356,19 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-        if reset:
+        # On a coordinated topology the orchestrator has already retired the old
+        # generation on every participant before this request was admitted, and
+        # it performs the post-request close itself. Repeating either here would
+        # discard the conditioning the upstream stage just produced (reset) or
+        # race the coordinator's own acknowledgement (close). The model-level
+        # begin/reset intent still reaches the pipeline through extra_args.
+        if reset and not self.lifecycle_externally_coordinated:
             self.reset_session(session_id)
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
             output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         self._perf_e2e_times.append(time.perf_counter() - started)
-        if close_session:
+        if close_session and not self.lifecycle_externally_coordinated:
             self.close_session(session_id)
         return output
 

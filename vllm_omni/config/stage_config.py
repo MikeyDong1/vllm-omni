@@ -310,6 +310,11 @@ class StagePipelineConfig:
     stage_input_payload_keys: tuple[str, ...] = ()
     # Declared send payload keys for diffusion producers; empty disables sending.
     stage_output_payload_keys: tuple[str, ...] = ()
+    # Opt in to topology-coordinated session lifecycle: the orchestrator owns
+    # reset/close/eviction ordering across these stages, and each stage's runner
+    # stops performing its own request-driven global cleanup. Leave False for
+    # single-stage deployments, which keep the runner-local behavior.
+    coordinated_session_lifecycle: bool = False
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -999,6 +1004,8 @@ def _build_engine_args(
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
+    if ps.coordinated_session_lifecycle:
+        engine_args["coordinated_session_lifecycle"] = True
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -1140,6 +1147,7 @@ def merge_pipeline_deploy(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
                 stage_role=ps.stage_role.value if ps.stage_role is not None else None,
+                coordinated_session_lifecycle=ps.coordinated_session_lifecycle,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1169,6 +1177,7 @@ class StageConfig:
     stage_id: int
     model_stage: str
     stage_role: str | None = None
+    coordinated_session_lifecycle: bool = False
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
@@ -1195,6 +1204,8 @@ class StageConfig:
         engine_args["model_stage"] = self.model_stage
         if self.stage_role is not None:
             engine_args["stage_role"] = self.stage_role
+        if self.coordinated_session_lifecycle:
+            engine_args["coordinated_session_lifecycle"] = True
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:

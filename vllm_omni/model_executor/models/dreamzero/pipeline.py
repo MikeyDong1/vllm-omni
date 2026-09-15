@@ -56,6 +56,7 @@ DREAMZERO_DISAGGREGATED_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=False,
             model_arch=_DREAMZERO_MODEL_ARCH,
+            coordinated_session_lifecycle=True,
             # Forward the non-final stage payload through custom_output.
             engine_output_type="custom",
         ),
@@ -69,6 +70,7 @@ DREAMZERO_DISAGGREGATED_PIPELINE = PipelineConfig(
             input_sources=(0,),
             final_output=False,
             model_arch=_DREAMZERO_MODEL_ARCH,
+            coordinated_session_lifecycle=True,
             engine_output_type="custom",
             custom_process_input_func=_DIFFUSION_HANDOFF,
         ),
@@ -82,6 +84,7 @@ DREAMZERO_DISAGGREGATED_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="image",
             model_arch=_DREAMZERO_MODEL_ARCH,
+            coordinated_session_lifecycle=True,
             custom_process_input_func=_DIFFUSION_HANDOFF,
         ),
     ),

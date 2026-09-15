@@ -454,3 +454,198 @@ def test_drop_session_calls_dreamzero_close_hook():
     serving.drop_session("rollout-1")
 
     assert closed == ["rollout-1"]
+
+
+def _stage(role, *, stage_type="diffusion", model_config=None):
+    return SimpleNamespace(
+        stage_type=stage_type,
+        stage_role=role,
+        model_stage=role,
+        engine_args=SimpleNamespace(model_config=model_config) if model_config is not None else None,
+    )
+
+
+def _disaggregated_engine(default_sampling_params_list=None, roles=("encode", "denoise", "decode")):
+    """Engine double exposing a multi-stage diffusion topology like the deploy yaml."""
+    stage_configs = [
+        _stage(
+            role,
+            model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG} if index == 0 else None,
+        )
+        for index, role in enumerate(roles)
+    ]
+    engine = SimpleNamespace(
+        get_diffusion_od_config=lambda: None,
+        stage_configs=stage_configs,
+        num_stages=len(stage_configs),
+    )
+    if default_sampling_params_list is not None:
+        engine.default_sampling_params_list = default_sampling_params_list
+    return engine
+
+
+def test_single_stage_topology_still_sends_one_sampling_params():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request({"prompt": "pick"}, session_id="s", reset=True)
+
+    assert serving.stage_roles == ("full",)
+    assert len(request.sampling_params_list) == 1
+    assert request.sampling_params_list[0] is request.sampling_params
+    assert request.sampling_params.extra_args["robot_obs"]["prompt"] == "pick"
+
+
+def test_three_stage_topology_builds_one_sampling_params_per_stage():
+    defaults = [
+        OmniDiffusionSamplingParams(num_inference_steps=1, extra_args={"stage": "encode", "shared": {"v": []}}),
+        OmniDiffusionSamplingParams(num_inference_steps=2, extra_args={"stage": "denoise"}),
+        OmniDiffusionSamplingParams(num_inference_steps=3, extra_args={"stage": "decode"}),
+    ]
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_disaggregated_engine(default_sampling_params_list=defaults)
+    )
+
+    request = serving._build_request({"prompt": "pick"}, session_id="wire", reset=True)
+    params_list = request.sampling_params_list
+
+    assert serving.stage_roles == ("encode", "denoise", "decode")
+    assert len(params_list) == 3
+    # Per-stage defaults survive: no stage is a copy of stage 0.
+    assert [params.num_inference_steps for params in params_list] == [1, 2, 3]
+    assert [params.extra_args["stage"] for params in params_list] == ["encode", "denoise", "decode"]
+    # Independent objects and independent mutable containers.
+    assert len({id(params) for params in params_list}) == 3
+    assert len({id(params.extra_args) for params in params_list}) == 3
+    params_list[0].extra_args["shared"]["v"].append("mutated")
+    assert defaults[0].extra_args["shared"] == {"v": []}
+    # The same normalized identity and lifecycle intent reaches every stage.
+    assert [params.extra_args["session_id"] for params in params_list] == ["wire"] * 3
+    assert [params.extra_args["reset"] for params in params_list] == [True] * 3
+    assert [params.extra_args["close_session"] for params in params_list] == [False] * 3
+    # Only the encoder-owning stage receives the raw observation.
+    assert params_list[0].extra_args["robot_obs"]["prompt"] == "pick"
+    assert "robot_obs" not in params_list[1].extra_args
+    assert "robot_obs" not in params_list[2].extra_args
+
+
+def test_three_stage_topology_shares_one_seed_across_stages():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_disaggregated_engine())
+
+    seeded = serving._build_request({"prompt": "pick", "seed": 7}, session_id="s", reset=True)
+    unseeded = serving._build_request({"prompt": "pick"}, session_id="s", reset=False)
+
+    assert [params.seed for params in seeded.sampling_params_list] == [7, 7, 7]
+    seeds = {params.seed for params in unseeded.sampling_params_list}
+    assert len(seeds) == 1
+    assert isinstance(next(iter(seeds)), int)
+
+
+def test_stage_defaults_are_not_mutated_between_requests():
+    defaults = [OmniDiffusionSamplingParams(extra_args={"session_id": "configured", "reset": True}) for _ in range(3)]
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_disaggregated_engine(default_sampling_params_list=defaults)
+    )
+
+    serving._build_request({"prompt": "pick"}, session_id="wire", reset=False)
+
+    for default_params in defaults:
+        assert default_params.extra_args == {"session_id": "configured", "reset": True}
+        assert default_params.seed is None
+
+
+def test_typed_tick_overrides_flat_session_controls_on_every_stage():
+    """A typed tick is authoritative; a typed False must beat a stale flat True."""
+    from vllm_omni.experimental.ar_diffusion.tick_protocol import AR_DIFFUSION_TICK_KEY
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_disaggregated_engine())
+    tick = {
+        "session_id": "typed-session",
+        "request_id": "tick-0",
+        "chunk_index": 0,
+        "reset": False,
+        "close_session": True,
+    }
+
+    request = serving._build_request(
+        {"prompt": "pick", AR_DIFFUSION_TICK_KEY: tick},
+        session_id="flat-session",
+        reset=True,
+        close_session=False,
+    )
+
+    for params in request.sampling_params_list:
+        assert params.extra_args["session_id"] == "typed-session"
+        assert params.extra_args["reset"] is False
+        assert params.extra_args["close_session"] is True
+        # The typed tick itself is forwarded so the runner applies the same
+        # precedence rather than re-deriving from the flat controls.
+        assert params.extra_args[AR_DIFFUSION_TICK_KEY] == tick
+    assert request.request_id.startswith("robot-typed-session-")
+
+
+def test_non_diffusion_stage_keeps_its_own_params_and_gets_no_policy_controls():
+    defaults = [
+        OmniDiffusionSamplingParams(extra_args={"stage": "encode"}),
+        OmniDiffusionSamplingParams(extra_args={"stage": "denoise"}),
+        OmniDiffusionSamplingParams(extra_args={"stage": "decode"}),
+        OmniDiffusionSamplingParams(extra_args={"stage": "llm"}),
+    ]
+    engine = _disaggregated_engine(default_sampling_params_list=defaults)
+    engine.stage_configs = list(engine.stage_configs) + [_stage("llm", stage_type="llm")]
+    engine.num_stages = 4
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    request = serving._build_request({"prompt": "pick"}, session_id="s", reset=True)
+
+    assert serving.stage_roles == ("encode", "denoise", "decode", None)
+    assert len(request.sampling_params_list) == 4
+    assert request.sampling_params_list[3].extra_args == {"stage": "llm"}
+
+
+def test_topology_without_an_encode_stage_is_rejected_with_an_actionable_error():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_disaggregated_engine(roles=("denoise", "decode"))
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        serving._build_request({"prompt": "pick"}, session_id="s", reset=True)
+
+    message = str(exc_info.value)
+    assert "no encode-capable diffusion stage" in message
+    assert "stage_role" in message
+
+
+def test_infer_sends_every_stage_params_to_generate():
+    engine = RecordingEngine()
+    engine.stage_configs = _disaggregated_engine().stage_configs
+    engine.num_stages = 3
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    actions = asyncio.run(serving.infer({"prompt": "pick"}, session_id="session-a", reset=True))
+
+    np.testing.assert_allclose(actions, np.asarray([0.0], dtype=np.float32))
+    sent = engine.generate_calls[0]["sampling_params_list"]
+    assert len(sent) == 3
+    assert [params.extra_args["session_id"] for params in sent] == ["session-a"] * 3
+
+
+def test_release_session_waits_for_the_last_connection_holding_it():
+    closed: list[str] = []
+    engine_client = SimpleNamespace(
+        model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG},
+        model_runner=SimpleNamespace(
+            pipeline=SimpleNamespace(close_ar_diffusion_session=lambda session_id: closed.append(session_id))
+        ),
+    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    serving.acquire_session("shared")
+    serving.acquire_session("shared")
+
+    assert asyncio.run(serving.release_session("shared")) is False
+    assert closed == []
+    assert serving.session_refcount("shared") == 1
+
+    assert asyncio.run(serving.release_session("shared")) is True
+    assert closed == ["shared"]
+    assert serving.session_refcount("shared") == 0

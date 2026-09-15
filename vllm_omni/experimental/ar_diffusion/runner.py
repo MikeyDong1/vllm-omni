@@ -27,6 +27,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCa
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.release_events import ARDiffusionReleaseEventLog
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.experimental.world_models.session_state import SessionStateLostError
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -266,6 +267,28 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """Whether runner-owned KV for ``session_id`` is currently resident."""
         return str(session_id) in self._sessions
 
+    def _reject_unknown_continuation(self, session_id: str, *, reset: bool) -> None:
+        """Refuse a continuation of a session this runner no longer holds.
+
+        Without this, ``_get_or_create_session`` would evict a healthy session to
+        make room for the unknown one, and only then would the pipeline reject the
+        request -- costing a live rollout its KV for nothing.
+
+        Opt-in: only a topology whose lifecycle is coordinated can rely on the
+        coordinator having already retired anything it released, so other
+        deployments keep the previous create-on-demand behavior.
+        """
+        if reset or not self.lifecycle_externally_coordinated:
+            return
+        if session_id in self._sessions:
+            return
+        raise SessionStateLostError(
+            f"AR-Diffusion session {session_id!r} has no resident KV on this stage, so this "
+            "request cannot continue it. Its paged KV was released (explicit close, LRU "
+            "eviction, or a failed forward) and cannot be rebuilt from a later chunk. Begin a "
+            'new rollout with extra_args["reset"]=True.'
+        )
+
     def _get_or_create_session(self, session_id: str) -> ARDiffusionKVState:
         state = self._sessions.get(session_id)
         if state is None:
@@ -364,6 +387,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # begin/reset intent still reaches the pipeline through extra_args.
         if reset and not self.lifecycle_externally_coordinated:
             self.reset_session(session_id)
+        self._reject_unknown_continuation(session_id, reset=reset)
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
             output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)

@@ -80,7 +80,7 @@ from vllm_omni.experimental.ar_diffusion.stage_lifecycle import (
     DiffusionStageLifecycleCoordinator,
     DiffusionStageLifecycleTopology,
     SessionLifecycleError,
-    SessionStateLostError,
+    SessionNotLiveError,
     read_session_controls,
 )
 from vllm_omni.metrics import definitions as metric_defs
@@ -593,7 +593,7 @@ class Orchestrator:
             return True
         try:
             generation = await coordinator.admit(request_id, controls)
-        except SessionStateLostError as exc:
+        except SessionNotLiveError as exc:
             await self._fail_request_client_error(
                 request_id,
                 stage_id,

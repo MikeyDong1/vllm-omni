@@ -54,7 +54,7 @@ class SessionLifecycleError(RuntimeError):
     """A coordinated lifecycle operation could not be completed safely."""
 
 
-class SessionStateLostError(SessionLifecycleError):
+class SessionNotLiveError(SessionLifecycleError):
     """A continuation refers to a session whose state no longer exists.
 
     Recovery is an explicit new rollout: the caller must send a begin/reset.
@@ -314,7 +314,7 @@ class DiffusionStageLifecycleCoordinator:
             else:
                 generation = self._live.get(session_id, 0)
                 if not generation:
-                    raise SessionStateLostError(
+                    raise SessionNotLiveError(
                         f"DreamZero session {session_id!r} has no live state on this topology; "
                         "its history was released (explicit close, eviction, or a failed request) "
                         "and a continuation cannot rebuild it. Start a new rollout with an "

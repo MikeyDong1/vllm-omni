@@ -36,6 +36,15 @@ DEFAULT_MAX_SESSIONS = 64
 M = TypeVar("M", bound=StateObject)
 
 
+class SessionStateLostError(RuntimeError):
+    """A continuation has no resident history; an explicit new session is required.
+
+    Raised by a model's stage-local lookup, as opposed to a coordinator's view of
+    which sessions are active: only the stage that owns the history can tell
+    whether it is actually still there.
+    """
+
+
 class SessionState:
     """The named ``StateObject`` collection for one session."""
 

@@ -23,7 +23,7 @@ from vllm_omni.experimental.ar_diffusion.stage_lifecycle import (
     DiffusionStageLifecycleTopology,
     SessionControls,
     SessionLifecycleError,
-    SessionStateLostError,
+    SessionNotLiveError,
     read_session_controls,
 )
 
@@ -222,7 +222,7 @@ def test_continuation_of_a_session_with_no_state_is_rejected_before_mutation():
     workers = _edd_workers()
     coordinator = _coordinator(workers)
 
-    with pytest.raises(SessionStateLostError, match="explicit reset"):
+    with pytest.raises(SessionNotLiveError, match="explicit reset"):
         asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=False))
 
     assert workers[ENCODE].sessions == {}
@@ -282,7 +282,7 @@ def test_continuing_an_evicted_session_fails_without_touching_healthy_ones():
     asyncio.run(_run_request(coordinator, workers, "r2", "C", reset=True))
     healthy_before = (dict(workers[ENCODE].sessions), dict(workers[DENOISE].sessions))
 
-    with pytest.raises(SessionStateLostError):
+    with pytest.raises(SessionNotLiveError):
         asyncio.run(_run_request(coordinator, workers, "r3", "A", reset=False))
 
     assert (workers[ENCODE].sessions, workers[DENOISE].sessions) == healthy_before
@@ -459,7 +459,7 @@ def test_a_dead_participant_invalidates_every_live_session():
     asyncio.run(coordinator.invalidate_all(reason="stage-1 replica-0 died"))
 
     assert coordinator.live_sessions == {}
-    with pytest.raises(SessionStateLostError):
+    with pytest.raises(SessionNotLiveError):
         asyncio.run(coordinator.admit("r2", SessionControls("A", reset=False)))
 
 
@@ -518,3 +518,166 @@ def test_a_hundred_begin_close_cycles_return_to_baseline():
         assert worker.sessions == {}
         assert worker.log.pending() == []
         assert worker.log.pending_count() == 0
+
+
+# -- release-event log ------------------------------------------------------
+
+
+def test_release_events_recorded_before_readiness_are_discarded():
+    """Startup warmup drives real rollouts; those are not user sessions."""
+    log = ARDiffusionReleaseEventLog(stage_id=1)
+
+    assert log.record("__ardiffusion_warmup__", reason="warmup_complete") is None
+    assert log.pending() == []
+
+    log.set_ready()
+    assert log.pending() == []
+    assert log.record("A", reason="lru_eviction") is not None
+    assert [event["session_id"] for event in log.pending()] == ["A"]
+
+
+def test_reading_release_events_does_not_consume_them():
+    log = ARDiffusionReleaseEventLog(stage_id=1)
+    log.set_ready()
+    log.record("A", reason="lru_eviction")
+
+    first = log.pending()
+    assert log.pending() == first
+    assert log.pending_count() == 1
+
+    assert log.acknowledge([first[0]["event_id"]]) == 1
+    assert log.pending() == []
+    # Acknowledging twice is harmless and reports nothing was still pending.
+    assert log.acknowledge([first[0]["event_id"]]) == 0
+
+
+def test_release_events_carry_the_registered_generation():
+    log = ARDiffusionReleaseEventLog(stage_id=2)
+    log.set_ready()
+    log.register_generation("A", 9)
+
+    log.record("A", reason="forward_exception")
+    log.record("B", reason="forward_exception")
+
+    by_session = {event["session_id"]: event for event in log.pending()}
+    assert by_session["A"]["generation"] == 9
+    assert by_session["A"]["stage_id"] == 2
+    # A session the coordinator never registered reports generation 0.
+    assert by_session["B"]["generation"] == 0
+
+    log.forget_generation("A")
+    log.record("A", reason="close")
+    assert [event["generation"] for event in log.pending() if event["reason"] == "close"] == [0]
+
+
+def test_coordinated_releases_are_suppressed_but_nested_use_is_safe():
+    log = ARDiffusionReleaseEventLog(stage_id=1)
+    log.set_ready()
+
+    with log.coordinated("A"):
+        with log.coordinated("A"):
+            assert log.record("A", reason="close") is None
+        # The inner block must not clear the outer suppression.
+        assert log.record("A", reason="close") is None
+    assert log.record("A", reason="close") is not None
+    # Suppression is per session.
+    with log.coordinated("A"):
+        assert log.record("B", reason="close") is not None
+
+
+def test_a_full_release_log_reports_overflow_instead_of_dropping_silently():
+    log = ARDiffusionReleaseEventLog(stage_id=1, max_pending=2)
+    log.set_ready()
+
+    log.record("A", reason="lru_eviction")
+    log.record("B", reason="lru_eviction")
+    assert log.overflowed is False
+
+    assert log.record("C", reason="lru_eviction") is None
+    assert log.overflowed is True
+    assert log.pending_count() == 2
+
+    log.acknowledge([event["event_id"] for event in log.pending()])
+    assert log.overflowed is False
+
+
+def test_release_event_round_trips_through_its_wire_form():
+    event = ARDiffusionReleaseEvent(
+        event_id="rel-1-0",
+        session_id="A",
+        reason="lru_eviction",
+        generation=4,
+        stage_id=1,
+        cleanup_failed=True,
+    )
+
+    assert ARDiffusionReleaseEvent.from_dict(event.to_dict()) == event
+    assert ARDiffusionReleaseEvent.from_dict(event) is event
+    with pytest.raises(ValueError, match="event_id"):
+        ARDiffusionReleaseEvent.from_dict({"session_id": "A"})
+    with pytest.raises(TypeError):
+        ARDiffusionReleaseEvent.from_dict(["not", "a", "dict"])
+
+
+# -- remaining ordering cases ----------------------------------------------
+
+
+def test_touching_b_makes_a_the_eviction_victim():
+    """Capacity two: begin A, begin B, touch B, begin C -> A is the victim."""
+    workers = _edd_workers(capacity=2)
+    coordinator = _coordinator(workers)
+
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    asyncio.run(_run_request(coordinator, workers, "r1", "B", reset=True))
+    asyncio.run(_run_request(coordinator, workers, "r2", "B"))
+    asyncio.run(_run_request(coordinator, workers, "r3", "C", reset=True))
+
+    assert not coordinator.is_active("A")
+    assert coordinator.is_active("B") and coordinator.is_active("C")
+    for stage_id in (ENCODE, DENOISE):
+        assert "A" not in workers[stage_id].sessions
+        assert set(workers[stage_id].sessions) == {"B", "C"}
+
+
+def test_unknown_continuation_while_full_releases_nothing():
+    workers = _edd_workers(capacity=2)
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    asyncio.run(_run_request(coordinator, workers, "r1", "B", reset=True))
+
+    before = {stage_id: dict(worker.sessions) for stage_id, worker in workers.items()}
+    closes_before = sum(1 for call in workers[ENCODE].calls if call[0] == "close_ar_diffusion_session")
+
+    with pytest.raises(SessionNotLiveError):
+        asyncio.run(_run_request(coordinator, workers, "r2", "unknown"))
+
+    assert {stage_id: dict(worker.sessions) for stage_id, worker in workers.items()} == before
+    closes_after = sum(1 for call in workers[ENCODE].calls if call[0] == "close_ar_diffusion_session")
+    assert closes_after == closes_before
+    assert set(coordinator.live_sessions) == {"A", "B"}
+
+
+def test_a_late_release_event_for_a_reused_id_is_ignored():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    stale_generation = coordinator.generation_of("A")
+    asyncio.run(coordinator.close("A"))
+    # The id is reused for a brand-new rollout.
+    asyncio.run(_run_request(coordinator, workers, "r1", "A", reset=True))
+    fresh_generation = coordinator.generation_of("A")
+    assert fresh_generation != stale_generation
+
+    async def scenario():
+        await coordinator.admit("r2", SessionControls("A"))
+        # A release event from the retired generation arrives late.
+        workers[DENOISE].log.register_generation("A", stale_generation)
+        workers[DENOISE].log.record("A", reason="lru_eviction")
+        workers[DENOISE].log.register_generation("A", fresh_generation)
+        with pytest.raises(SessionLifecycleError, match="generation"):
+            await coordinator.complete("r2", success=True)
+
+    asyncio.run(scenario())
+    # The new rollout was not retired by the stale event.
+    assert coordinator.generation_of("A") == fresh_generation

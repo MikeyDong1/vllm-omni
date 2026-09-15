@@ -15,7 +15,7 @@ import math
 import os
 import re as re_module
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -73,8 +73,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.experimental.world_models.adapters.state_dreamzero_adapter import DreamZeroStateAdapter
 from vllm_omni.experimental.world_models.session_state import (
+    SessionStateLostError,
     SessionStateManager,
     resolve_session_state_config,
 )
@@ -156,6 +158,8 @@ class _DreamZeroEncoded:
     """Everything the denoise phase consumes from the encode phase."""
 
     session_id: str
+    # Coordinator-issued generation for this rollout; 0 when uncoordinated.
+    generation: int
     reset_reason: str | None
     window_start: bool
     current_start_frame: int
@@ -266,12 +270,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """Remove model state and clear the compatibility alias when it points there."""
         key = str(session_id or "default")
         # Discard ordering with the session so reused IDs do not inherit progress.
-        for progress in (
+        # The coordinator-issued generation goes with it: a later begin gets a new
+        # one, so a reused id cannot be mistaken for the retired rollout.
+        for bookkeeping in (
             getattr(self, "_issued_progress", None),
             getattr(self, "_committed_progress", None),
+            getattr(self, "_session_generations", None),
         ):
-            if progress is not None:
-                progress.pop(key, None)
+            if bookkeeping is not None:
+                bookkeeping.pop(key, None)
         # Local binding narrows the Optional and guards lightweight test fixtures
         # that build the pipeline via __new__ without setting _memory_manager.
         manager = getattr(self, "_memory_manager", None)
@@ -396,6 +403,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             boundary=DREAMZERO_BOUNDARY_ENCODE_TO_DIT,
             scalar_fields={
                 "session_id": session_id,
+                # Warmup is not a coordinated rollout, so it carries no generation.
+                "generation": 0,
                 # The runner already released this session at index 0.
                 "reset_reason": None,
                 "window_start": window_start,
@@ -674,6 +683,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # Keep issue and commit ledgers separate even in FULL mode; see _DreamZeroSessionProgress.
         self._issued_progress: dict[str, _DreamZeroSessionProgress] = {}
         self._committed_progress: dict[str, _DreamZeroSessionProgress] = {}
+        # Coordinator-issued generation per live session; identity only, so the
+        # weightless postprocess stage can carry it too. Empty when uncoordinated.
+        self._session_generations: dict[str, int] = {}
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         # Opt-in: back per-session state with the shared SessionStateManager
@@ -687,6 +699,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         if self._use_memory_manager:
             logger.info("DreamZero: session state manager enabled (max_sessions=%d)", mm_max_sessions)
+        # The shared manager runs its own count-based LRU, independent of the
+        # denoise runner's. Its evictions are therefore invisible to the
+        # cross-stage coordinator, which would leave a peer stage holding history
+        # for a session this store silently dropped. Until that store publishes
+        # an eviction notification (or #7302's refuse-at-capacity policy lands),
+        # refuse the combination rather than pretend it is coordinated.
+        if self._use_memory_manager and bool(getattr(od_config, "coordinated_session_lifecycle", False)):
+            raise ValueError(
+                "DreamZero cannot combine the shared session-state manager with the "
+                f"coordinated {role!r} topology: the manager evicts sessions on its own "
+                "count-based LRU, and those evictions are not reported to the cross-stage "
+                "lifecycle coordinator, so a peer stage would keep history for a session "
+                "whose state is gone. Run the disaggregated topology on the default "
+                "per-pipeline state store (unset enable_session_state_manager), or use the "
+                "single-stage deployment with the manager."
+            )
         # Postprocess is stateless; other roles retain stage-local history.
         self.state = self._get_or_create_state("default") if self._holds_session_state else None
 
@@ -780,6 +808,80 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             self._states.move_to_end(session_key)
         return state
+
+    def _require_session_state(self, session_id: str | None) -> DreamZeroSessionState:
+        """Look up resident state for a continuation; never create a replacement.
+
+        Read-only by design: a session whose history is gone cannot be rebuilt
+        from a later chunk, so the request is refused before preprocessing
+        advances counters or VAE history.
+        """
+        session_key = str(session_id or "default")
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            # Check membership first: ``DreamZeroStateAdapter``'s constructor
+            # creates missing state, which would bypass this validation entirely.
+            if session_key not in manager:
+                raise SessionStateLostError(self._session_state_lost_message(session_key))
+            return DreamZeroStateAdapter(
+                session_id,
+                manager,
+                vae_encoder_window=self.num_frame_per_block,
+            )
+        state = self._states.get(session_key)
+        if state is None:
+            raise SessionStateLostError(self._session_state_lost_message(session_key))
+        self._states.move_to_end(session_key)
+        return state
+
+    def has_session_state(self, session_id: str | None) -> bool:
+        """Whether resident state for ``session_id`` exists on this stage."""
+        session_key = str(session_id or "default")
+        manager = getattr(self, "_memory_manager", None)
+        if manager is not None:
+            return session_key in manager
+        return session_key in self._states
+
+    @staticmethod
+    def _session_state_lost_message(session_key: str) -> str:
+        return (
+            f"DreamZero session {session_key!r} has no resident state, so this request cannot "
+            "continue it. Its per-session history (including the VAE causal-convolution cache) "
+            "cannot be rebuilt, so the request is refused rather than silently restarted on empty "
+            'state. Begin a new session by sending a request with extra_args["reset"]=True.'
+        )
+
+    @staticmethod
+    def _request_begins_session(extra_args: Mapping[str, object]) -> bool:
+        """Whether this request begins (or restarts) the session.
+
+        A typed tick is authoritative, matching the runner's precedence: its
+        ``reset`` replaces the flat flag instead of being OR-ed with it, so a
+        typed ``False`` is not overridden by a stale flat ``True``.
+        """
+        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        if tick is not None:
+            return bool(tick.reset)
+        return bool(extra_args.get("reset", False))
+
+    def register_session_generation(self, session_id: str, generation: int) -> bool:
+        """Bind the coordinator-issued generation this stage should now accept.
+
+        Identity only: nothing resident is allocated, so the weightless
+        postprocess stage can take part without gaining per-session tensors.
+        """
+        key = str(session_id or "default")
+        generations = getattr(self, "_session_generations", None)
+        if generations is None:
+            generations = {}
+            self._session_generations = generations
+        generations[key] = int(generation)
+        return True
+
+    def registered_session_generation(self, session_id: str) -> int:
+        """The generation this stage accepts, or 0 when none was ever issued."""
+        generations = getattr(self, "_session_generations", None) or {}
+        return int(generations.get(str(session_id or "default"), 0))
 
     # -----------------------------------------------------------------------
     # Root config loading
@@ -1290,8 +1392,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return self.vae.decode(latents, return_dict=False)[0]
 
     def decode_accumulated_video_latents(self, session_id: str | None = None) -> torch.Tensor:
-        """Decode all AR-chunk latents accumulated for ``session_id``."""
-        state = self._get_or_create_state(session_id)
+        """Decode all AR-chunk latents accumulated for ``session_id``.
+
+        Read-only in the session state: exporting after the session was closed
+        fails instead of creating empty state to decode from.
+        """
+        if self.vae is None:
+            raise RuntimeError(
+                f"DreamZero cannot decode accumulated video latents on a {self.stage_role.value!r} "
+                "stage: it owns no VAE. Export from the stage that holds the encoders, or run the "
+                "single-stage (full) deployment."
+            )
+        state = self._require_session_state(session_id)
         latents = state.get_concatenated_video_latents()
         if latents is None:
             session_key = str(session_id or "default")
@@ -1299,8 +1411,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return self.decode_video_latents(latents)
 
     def clear_accumulated_video_latents(self, session_id: str | None = None) -> None:
-        """Clear accumulated video latents for ``session_id`` without resetting KV state."""
-        state = self._get_or_create_state(session_id)
+        """Clear the export buffer for ``session_id``, keeping the session alive.
+
+        Distinct from closing: VAE causal history and KV are untouched, so the
+        rollout can continue after its exported latents are dropped.
+        """
+        state = self._require_session_state(session_id)
         state.clear_video_latents()
 
     # -----------------------------------------------------------------------
@@ -1649,9 +1765,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             raise KeyError("robot_obs")
 
         session_id = str(extra_args.get("session_id") or "default")
-        explicit_reset = bool(extra_args.get("reset", False))
-        state = self._get_or_create_state(session_id)
+        explicit_reset = self._request_begins_session(extra_args)
+        # Only a begin/reset may create state. A continuation has to find its
+        # existing history here, before preprocessing advances any counter or
+        # appends a frame; restarting it on empty state would silently produce
+        # actions conditioned on nothing.
+        if explicit_reset:
+            state = self._get_or_create_state(session_id)
+        else:
+            state = self._require_session_state(session_id)
         self.state = state
+        generation = self.registered_session_generation(session_id)
         embodiment_key = str(robot_obs.get("embodiment", self.default_robot_embodiment))
         _transform, unified_obs = self._transform_robot_obs(robot_obs)
         device = get_local_device()
@@ -1814,6 +1938,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         return _DreamZeroEncoded(
             session_id=session_id,
+            generation=generation,
             reset_reason=reset_reason,
             window_start=window_start,
             current_start_frame=int(state.current_start_frame),
@@ -1857,6 +1982,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 "DreamZero denoise stage ran without a bound AR-Diffusion session; "
                 "the stage must run on the AR-Diffusion engine."
             )
+        # A continuation whose window state is gone here -- but not on encode --
+        # is the case where only one participant lost its state. Refuse it before
+        # creating replacement bookkeeping that would look like a fresh window.
+        if encoded.reset_reason is None and not self.has_session_state(session_id):
+            raise SessionStateLostError(self._session_state_lost_message(str(session_id or "default")))
         state = self._get_or_create_state(session_id)
         self.state = state
         # Authorize before binding conditioning or resetting anything.
@@ -2065,6 +2195,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             boundary=DREAMZERO_BOUNDARY_ENCODE_TO_DIT,
             scalar_fields={
                 "session_id": enc.session_id,
+                "generation": int(enc.generation),
                 "reset_reason": enc.reset_reason,
                 "window_start": bool(enc.window_start),
                 "current_start_frame": int(enc.current_start_frame),
@@ -2093,6 +2224,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         session_id = str(payload.scalar("session_id"))
         encoded = _DreamZeroEncoded(
             session_id=session_id,
+            generation=int(payload.scalar("generation", 0)),
             reset_reason=payload.scalar("reset_reason", None),
             window_start=bool(payload.scalar("window_start")),
             current_start_frame=int(payload.scalar("current_start_frame")),
@@ -2155,9 +2287,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         """Validate chunk ordering before KV reset or model/KV mutation.
 
         Reject stale, duplicate, out-of-order and fenced requests before
-        they can be partially applied.
+        they can be partially applied. Side-effect free on purpose: failed
+        validation must not leave partially advanced bookkeeping behind, so
+        committed progress moves only in ``_commit_stage_progress`` after the
+        chunk's work actually succeeded.
         """
-        committed = self._committed_progress.setdefault(enc.session_id, _DreamZeroSessionProgress())
+        # A payload from a generation this stage has already replaced is late by
+        # definition; reject it before it can reset KV or touch model state.
+        registered = self.registered_session_generation(enc.session_id)
+        if registered and enc.generation and enc.generation != registered:
+            raise DreamZeroStaleRequestError(
+                f"DreamZero session {enc.session_id!r} payload belongs to generation "
+                f"{enc.generation} but this stage is registered for generation {registered}; "
+                "the rollout was reset or retired after the payload was produced."
+            )
+
+        committed = self._committed_progress.get(enc.session_id) or _DreamZeroSessionProgress()
 
         if enc.epoch < committed.epoch:
             raise DreamZeroStaleRequestError(
@@ -2172,9 +2317,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     f"DreamZero session {enc.session_id!r} opens epoch {enc.epoch} at sequence "
                     f"{enc.sequence}; a new epoch must start at sequence 1."
                 )
-            committed.epoch = enc.epoch
-            committed.sequence = 0
-            committed.attempt = 0
         elif enc.sequence <= committed.sequence:
             raise DreamZeroStaleRequestError(
                 f"DreamZero session {enc.session_id!r} chunk {enc.sequence} is a duplicate or "

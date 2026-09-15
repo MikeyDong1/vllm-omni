@@ -25,7 +25,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
-from vllm_omni.experimental.ar_diffusion.release_events import ARDiffusionReleaseEventLog
+from vllm_omni.experimental.ar_diffusion.release_events import (
+    ARDiffusionReleaseEventLog,
+    SessionGenerationUnsupportedError,
+)
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.experimental.world_models.session_state import SessionStateLostError
 from vllm_omni.platforms import current_omni_platform
@@ -222,6 +225,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # Record before raising: peers must learn this stage dropped the session
         # even when local cleanup only partly succeeded.
         self.release_events.record(session_id, reason=reason, cleanup_failed=bool(errors))
+        # The event above captured the generation, so the binding can go; keeping
+        # one per session id ever seen would grow without bound.
+        self.release_events.forget_generation(session_id)
         if errors:
             if suppress_errors:
                 logger.warning(
@@ -255,7 +261,31 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return self.release_events.acknowledge(event_ids)
 
     def register_ar_diffusion_generation(self, session_id: str, generation: int) -> bool:
-        """Stamp the generation this stage's releases should be reported under."""
+        """Bind one generation to both the release log and the loaded model.
+
+        The runner owns registration for a stage that has one: reporting only to
+        its own event log would leave the model unable to fence a stale payload.
+        A model that does not implement the hook cannot be fenced, so on a
+        coordinated topology that is a failure rather than a silent success.
+        """
+        pipeline = getattr(self, "pipeline", None)
+        register = getattr(pipeline, "register_session_generation", None)
+        if not callable(register):
+            if self.lifecycle_externally_coordinated:
+                raise SessionGenerationUnsupportedError(
+                    f"{type(pipeline).__name__} does not implement register_session_generation(), so "
+                    "it cannot reject a payload from a replaced generation. A coordinated topology "
+                    "requires it on every participant."
+                )
+            self.release_events.register_generation(session_id, generation)
+            return True
+        if not bool(register(session_id, int(generation))):
+            raise SessionGenerationUnsupportedError(
+                f"{type(pipeline).__name__}.register_session_generation() refused generation "
+                f"{generation} for session {session_id!r}."
+            )
+        # Only after the model accepted it, so a failed registration cannot leave
+        # the log stamping releases with a generation the model never took.
         self.release_events.register_generation(session_id, generation)
         return True
 

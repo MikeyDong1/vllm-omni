@@ -27,6 +27,10 @@ COORDINATED_REASONS = frozenset({"coordinated_reset", "coordinated_close"})
 DEFAULT_MAX_PENDING_RELEASE_EVENTS = 256
 
 
+class SessionGenerationUnsupportedError(RuntimeError):
+    """A participant cannot bind the coordinator's generation, so it cannot fence."""
+
+
 @dataclass(frozen=True)
 class ARDiffusionReleaseEvent:
     """One session release a worker performed without being asked.

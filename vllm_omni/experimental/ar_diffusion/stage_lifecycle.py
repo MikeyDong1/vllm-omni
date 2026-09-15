@@ -174,18 +174,36 @@ class DiffusionStageLifecycleCoordinator:
         self._blocked_reason = None
 
     async def _call(self, method: str, stage_ids: Iterable[int], *args: Any) -> dict[int, Any]:
+        """Invoke one method per stage, converting transport errors into results.
+
+        A raised transport error must not abandon the remaining participants: the
+        caller still has cleanup to attempt on them.
+        """
         results: dict[int, Any] = {}
         for stage_id in stage_ids:
-            results[stage_id] = await self._rpc(method, stage_id, tuple(args))
+            try:
+                results[stage_id] = await self._rpc(method, stage_id, tuple(args))
+            except Exception as exc:  # noqa: BLE001 - reported per stage, not raised
+                results[stage_id] = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
         return results
 
     @staticmethod
     def _collect_support(value: Any, *, errors: list[str], supported: list[bool]) -> None:
-        """Flatten per-replica/per-rank results into support and error lists."""
+        """Flatten per-replica/per-rank results into support and error lists.
+
+        Only ``True`` counts as an acknowledgement. ``False``, ``None``, an empty
+        reply and an unrecognized shape are all failures: a lifecycle operation
+        that cannot be confirmed has not happened.
+        """
         if isinstance(value, bool):
             supported.append(value)
+            if not value:
+                errors.append("worker declined the operation (returned False)")
             return
         if isinstance(value, (list, tuple)):
+            if not value:
+                errors.append("empty reply, so no worker acknowledged")
+                return
             for item in value:
                 DiffusionStageLifecycleCoordinator._collect_support(item, errors=errors, supported=supported)
             return
@@ -195,24 +213,33 @@ class DiffusionStageLifecycleCoordinator:
                 return
             if "result" in value:
                 DiffusionStageLifecycleCoordinator._collect_support(value["result"], errors=errors, supported=supported)
+                return
+            errors.append(f"unrecognized reply {sorted(value)!r}")
             return
         if value is None:
-            # A worker that returned nothing did not report success.
-            supported.append(False)
+            errors.append("worker returned nothing, so it did not acknowledge")
+            return
+        errors.append(f"unrecognized reply of type {type(value).__name__}")
+
+    def _validate_acknowledgements(self, method: str, results: Mapping[int, Any]) -> list[str]:
+        """Return one failure string per stage that did not fully acknowledge."""
+        failures: list[str] = []
+        for stage_id, value in results.items():
+            errors: list[str] = []
+            supported: list[bool] = []
+            self._collect_support(value, errors=errors, supported=supported)
+            if errors or not supported or not all(supported):
+                detail = "; ".join(errors) or "no acknowledgement"
+                failures.append(f"stage {stage_id}: {detail}")
+        return failures
 
     async def _fan_out(self, method: str, session_id: str, stage_ids: Sequence[int]) -> None:
         """Run one lifecycle method on every listed stage, failing loudly."""
         results = await self._call(method, stage_ids, session_id)
-        errors: list[str] = []
-        supported: list[bool] = []
-        for stage_id, value in results.items():
-            stage_errors: list[str] = []
-            self._collect_support(value, errors=stage_errors, supported=supported)
-            errors.extend(f"stage {stage_id}: {error}" for error in stage_errors)
-        if errors or not supported or not all(supported):
-            detail = "; ".join(errors) or "at least one participant does not support it"
+        failures = self._validate_acknowledgements(method, results)
+        if failures:
             raise SessionLifecycleError(
-                f"{method} for session {session_id!r} did not complete on every participant: {detail}"
+                f"{method} for session {session_id!r} did not complete on every participant: " + "; ".join(failures)
             )
 
     def _require_single_replica_layout(self) -> None:
@@ -233,31 +260,32 @@ class DiffusionStageLifecycleCoordinator:
                     "the session's state cannot be reached."
                 )
 
-    def _new_generation(self, session_id: str) -> int:
-        self._next_generation += 1
-        generation = self._next_generation
-        self._live[str(session_id)] = generation
-        self._live.move_to_end(str(session_id))
-        return generation
-
     def _retire_locally(self, session_id: str) -> None:
         self._live.pop(str(session_id), None)
 
     async def _evict_oldest_if_needed(self) -> None:
-        """Keep the registry bounded, retiring the oldest through the fan-out."""
+        """Keep the registry bounded, retiring the oldest through the fan-out.
+
+        A victim's history is released irreversibly, so it is never resurrected in
+        the registry. If its cleanup cannot be confirmed, block reuse instead of
+        leaving a stage holding state nothing tracks.
+        """
         while len(self._live) > self._max_live_sessions:
-            victim, _ = next(iter(self._live.items()))
+            victim, generation = next(iter(self._live.items()))
             logger.warning(
                 "Coordinated session registry is full (%d); retiring least-recently-used session %s",
                 self._max_live_sessions,
                 victim,
             )
             self._retire_locally(victim)
-            await self._fan_out(
-                "close_ar_diffusion_session",
-                victim,
-                self.topology.state_owning_stage_ids,
-            )
+            results = await self._call("close_ar_diffusion_session", self.topology.state_owning_stage_ids, victim)
+            failures = self._validate_acknowledgements("close_ar_diffusion_session", results)
+            if failures:
+                self._blocked_reason = (
+                    f"registry eviction of session {victim!r} generation {generation} was not "
+                    "confirmed: " + "; ".join(failures)
+                )
+                raise SessionLifecycleError(self._blocked_reason)
 
     async def admit(self, request_id: str, controls: SessionControls) -> int:
         """Order one request against the topology and return its generation.
@@ -267,63 +295,102 @@ class DiffusionStageLifecycleCoordinator:
         be served; the caller must then fail it instead of submitting it.
         """
         await self._gate.acquire()
+        session_id = str(controls.session_id)
+        # Nothing is published until every registration acknowledges, so a failed
+        # admission cannot leave a half-registered session continuable.
+        candidate: int | None = None
+        committed = False
         try:
             if self._blocked_reason is not None:
                 raise SessionLifecycleError(
                     f"Coordinated session lifecycle is blocked pending recovery: {self._blocked_reason}"
                 )
             self._require_single_replica_layout()
-            session_id = str(controls.session_id)
             coordinated: set[str] = set()
 
             if controls.reset:
                 # The gate already drained older work; retire every participant
-                # once here so no downstream stage repeats it.
+                # once here so no downstream stage repeats it. Once its remote
+                # history is gone the old generation is not restorable, so a
+                # later failure must not put it back.
                 if session_id in self._live:
                     await self._retire_session(session_id, reason="coordinated_reset")
                     coordinated.add(session_id)
-                generation = self._new_generation(session_id)
-                await self._evict_oldest_if_needed()
+                self._next_generation += 1
+                candidate = self._next_generation
             else:
-                generation = self._live.get(session_id, 0)
-                if not generation:
+                candidate = self._live.get(session_id, 0)
+                if not candidate:
                     raise SessionNotLiveError(
                         f"DreamZero session {session_id!r} has no live state on this topology; "
                         "its history was released (explicit close, eviction, or a failed request) "
                         "and a continuation cannot rebuild it. Start a new rollout with an "
                         "explicit reset."
                     )
-                self._live.move_to_end(session_id)
 
-            await self._register_generation(session_id, generation)
+            await self._register_generation(session_id, candidate)
+
+            # Registration is confirmed on every participant: publish.
+            self._live[session_id] = candidate
+            self._live.move_to_end(session_id)
+            await self._evict_oldest_if_needed()
             self._inflight = _InFlight(
                 request_id=str(request_id),
                 session_id=session_id,
-                generation=generation,
+                generation=candidate,
                 close_session=bool(controls.close_session),
                 coordinated_sessions=coordinated,
             )
-            return generation
+            committed = True
+            return candidate
         except BaseException:
             self._inflight = None
-            self._gate.release()
+            if candidate and not committed:
+                # A participant may already have taken the candidate; clean it
+                # everywhere so it cannot be continued, and block reuse when the
+                # rollback itself cannot be confirmed.
+                await self._rollback_candidate(session_id, candidate)
             raise
+        finally:
+            if not committed:
+                self._gate.release()
 
     async def _register_generation(self, session_id: str, generation: int) -> None:
         """Bind the generation on every participant before payload execution.
 
-        Identity only, so the stateless postprocess stage allocates nothing.
+        Identity only, so the stateless postprocess stage allocates nothing. A
+        participant that declines cannot fence a stale payload, so anything short
+        of an acknowledgement from every one of them fails the admission.
         """
-        results = await self._call("register_ar_diffusion_generation", self.topology.stage_ids, session_id, generation)
-        for stage_id, value in results.items():
-            errors: list[str] = []
-            supported: list[bool] = []
-            self._collect_support(value, errors=errors, supported=supported)
-            if errors:
-                raise SessionLifecycleError(
-                    f"Registering generation {generation} for session {session_id!r} failed on stage "
-                    f"{stage_id}: {'; '.join(errors)}"
-                )
+        method = "register_ar_diffusion_generation"
+        results = await self._call(method, self.topology.stage_ids, session_id, generation)
+        failures = self._validate_acknowledgements(method, results)
+        if failures:
+            raise SessionLifecycleError(
+                f"Registering generation {generation} for session {session_id!r} was not "
+                "acknowledged by every participant: " + "; ".join(failures)
+            )
+
+    async def _rollback_candidate(self, session_id: str, generation: int) -> None:
+        """Undo a failed admission, or block reuse when it cannot be confirmed.
+
+        The generation counter is never rewound: a consumed id stays consumed, so
+        a retried begin cannot collide with state a participant already took.
+        """
+        self._live.pop(session_id, None)
+        results = await self._call("close_ar_diffusion_session", self.topology.state_owning_stage_ids, session_id)
+        failures = self._validate_acknowledgements("close_ar_diffusion_session", results)
+        if failures:
+            self._blocked_reason = (
+                f"rollback of session {session_id!r} generation {generation} was not confirmed: " + "; ".join(failures)
+            )
+            logger.error("Coordinated session lifecycle blocked: %s", self._blocked_reason)
+            return
+        logger.info(
+            "Rolled back failed admission of session %s generation %d on every participant",
+            session_id,
+            generation,
+        )
 
     async def _retire_session(self, session_id: str, *, reason: str) -> None:
         """Clear a session on every state-owning participant and mark it inactive."""
@@ -466,9 +533,74 @@ class DiffusionStageLifecycleCoordinator:
             # Leave them unacknowledged so a retry still sees them.
             raise SessionLifecycleError("; ".join(conflicts + retire_errors))
 
+        ack_failures: list[str] = []
         for stage_id, event_ids in acks.items():
-            if event_ids:
-                await self._call("ack_ar_diffusion_release_events", [stage_id], event_ids)
+            if not event_ids:
+                continue
+            results = await self._call("ack_ar_diffusion_release_events", [stage_id], event_ids)
+            # An unconfirmed acknowledgement leaves the events pending on the
+            # worker; assuming it consumed them would replay or lose them.
+            ack_failures.extend(self._validate_ack_counts(results, expected=len(event_ids)))
+        if ack_failures:
+            raise SessionLifecycleError("; ".join(ack_failures))
+
+    def _validate_ack_counts(self, results: Mapping[int, Any], *, expected: int) -> list[str]:
+        """Check that every stage answered the acknowledgement.
+
+        A count below ``expected`` is not a failure: acknowledgement has to be
+        idempotent, because a retry after a partially failed ack re-sends ids some
+        ranks have already dropped. What must not pass is an error, an unsupported
+        participant or a reply nobody answered -- those leave the events pending on
+        the worker, and assuming otherwise would lose or replay them.
+        """
+        failures: list[str] = []
+        for stage_id, value in results.items():
+            counts: list[int] = []
+            errors: list[str] = []
+            _collect_ack_counts(value, counts=counts, errors=errors)
+            if errors:
+                failures.append(f"stage {stage_id} release-event ack: {'; '.join(errors)}")
+                continue
+            if not counts:
+                failures.append(f"stage {stage_id} release-event ack was not acknowledged")
+                continue
+            if any(count != expected for count in counts):
+                # Ranks that disagree about what they held are worth seeing; a
+                # genuine divergence is already caught when the events are decoded.
+                logger.debug(
+                    "Stage %d acknowledged %s of %d release event(s)",
+                    stage_id,
+                    counts,
+                    expected,
+                )
+        return failures
+
+
+def _collect_ack_counts(value: Any, *, counts: list[int], errors: list[str]) -> None:
+    """Flatten an ``ack_ar_diffusion_release_events`` reply into removal counts."""
+    if isinstance(value, bool):
+        errors.append("worker returned a flag instead of a removal count")
+        return
+    if isinstance(value, int):
+        counts.append(value)
+        return
+    if isinstance(value, (list, tuple)):
+        if not value:
+            errors.append("empty reply, so no worker acknowledged")
+            return
+        for item in value:
+            _collect_ack_counts(item, counts=counts, errors=errors)
+        return
+    if isinstance(value, Mapping):
+        if value.get("supported") is False:
+            errors.append(str(value.get("error") or "stage does not support release-event acknowledgement"))
+            return
+        if "result" in value:
+            _collect_ack_counts(value["result"], counts=counts, errors=errors)
+            return
+        errors.append(f"unrecognized reply {sorted(value)!r}")
+        return
+    errors.append(f"unrecognized reply of type {type(value).__name__}")
 
 
 def _decode_release_events(value: Any) -> tuple[list[ARDiffusionReleaseEvent], list[str]]:

@@ -84,8 +84,8 @@ class FakeStageWorker:
             return self.log.pending()
         if method == "ack_ar_diffusion_release_events":
             (event_ids,) = args
-            self.log.acknowledge(event_ids)
-            return True
+            # The real worker returns how many records it dropped, not a flag.
+            return self.log.acknowledge(event_ids)
         raise AssertionError(f"unexpected lifecycle RPC {method}")
 
     async def collective_rpc(self, method: str, args: tuple):
@@ -681,3 +681,237 @@ def test_a_late_release_event_for_a_reused_id_is_ignored():
     asyncio.run(scenario())
     # The new rollout was not retired by the stale event.
     assert coordinator.generation_of("A") == fresh_generation
+
+
+# -- strict acknowledgement and transactional admission ---------------------
+
+
+class RegistrationRefusingWorker(FakeStageWorker):
+    """A worker whose registration returns the real ``False`` contract."""
+
+    def _dispatch(self, method, args):
+        if method == "register_ar_diffusion_generation":
+            self.calls.append((method, args))
+            return False
+        return super()._dispatch(method, args)
+
+
+class RegistrationErroringWorker(FakeStageWorker):
+    def _dispatch(self, method, args):
+        if method == "register_ar_diffusion_generation":
+            self.calls.append((method, args))
+            raise RuntimeError("registration exploded")
+        return super()._dispatch(method, args)
+
+
+class RegistrationSilentWorker(FakeStageWorker):
+    """Returns None, the shape a worker with no lifecycle support produces."""
+
+    def _dispatch(self, method, args):
+        if method == "register_ar_diffusion_generation":
+            self.calls.append((method, args))
+            return None
+        return super()._dispatch(method, args)
+
+
+def _closes(worker: FakeStageWorker, session_id: str) -> int:
+    return sum(1 for call in worker.calls if call == ("close_ar_diffusion_session", (session_id,)))
+
+
+@pytest.mark.parametrize(
+    "worker_cls",
+    [RegistrationRefusingWorker, RegistrationErroringWorker, RegistrationSilentWorker],
+)
+def test_a_declined_registration_fails_admission_and_publishes_nothing(worker_cls):
+    """`False`, a raised error and `None` are all failures, not acknowledgements."""
+    workers = _edd_workers()
+    healthy_denoise = workers[DENOISE]
+    workers[DENOISE] = worker_cls(DENOISE)
+    coordinator = _coordinator(workers)
+
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.admit("r0", SessionControls("A", reset=True)))
+
+    assert coordinator.live_sessions == {}
+    assert not coordinator.is_active("A")
+    # Rolled back on every state-owning participant, including the one that
+    # acknowledged before the failure.
+    assert _closes(workers[ENCODE], "A") == 1
+    # The gate was released, so the topology still serves other work.
+    workers[DENOISE] = healthy_denoise
+    asyncio.run(_run_request(coordinator, workers, "r1", "B", reset=True))
+    assert coordinator.is_active("B")
+
+
+def test_a_failed_admission_cannot_be_continued():
+    workers = _edd_workers()
+    workers[DENOISE] = RegistrationRefusingWorker(DENOISE)
+    coordinator = _coordinator(workers)
+
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.admit("r0", SessionControls("A", reset=True)))
+
+    with pytest.raises(SessionNotLiveError):
+        asyncio.run(coordinator.admit("r1", SessionControls("A")))
+
+
+def test_a_rollback_that_cannot_be_confirmed_blocks_the_topology():
+    workers = _edd_workers()
+    workers[DENOISE] = RegistrationRefusingWorker(DENOISE)
+    workers[ENCODE].fail_close.add("A")
+    coordinator = _coordinator(workers)
+
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.admit("r0", SessionControls("A", reset=True)))
+
+    assert coordinator.blocked_reason is not None
+    assert "rollback" in coordinator.blocked_reason
+    with pytest.raises(SessionLifecycleError, match="blocked pending recovery"):
+        asyncio.run(coordinator.admit("r1", SessionControls("B", reset=True)))
+
+
+def test_a_failed_reset_does_not_restore_the_old_generation():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    old_generation = coordinator.generation_of("A")
+
+    # The reset retires A, then its replacement registration is refused.
+    workers[DENOISE] = RegistrationRefusingWorker(DENOISE)
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.admit("r1", SessionControls("A", reset=True)))
+
+    # Neither generation is continuable; the old one is not resurrected.
+    assert coordinator.live_sessions == {}
+    assert coordinator.generation_of("A") != old_generation
+    with pytest.raises(SessionNotLiveError):
+        asyncio.run(coordinator.admit("r2", SessionControls("A")))
+
+
+def test_the_generation_counter_never_rewinds_after_a_failure():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    first = coordinator.generation_of("A")
+
+    failing = RegistrationRefusingWorker(DENOISE)
+    healthy = workers[DENOISE]
+    workers[DENOISE] = failing
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.admit("r1", SessionControls("B", reset=True)))
+
+    workers[DENOISE] = healthy
+    asyncio.run(_run_request(coordinator, workers, "r2", "B", reset=True))
+
+    # The failed attempt consumed an id rather than handing it to B.
+    assert coordinator.generation_of("B") > first + 1
+
+
+def test_an_unexpected_transport_error_still_reaches_the_other_participants():
+    workers = _edd_workers()
+
+    class ExplodingRPC(FakeTopologyRuntime):
+        async def rpc(self, method, stage_id, args):
+            if method == "register_ar_diffusion_generation" and stage_id == DENOISE:
+                raise ConnectionResetError("transport died")
+            return await super().rpc(method, stage_id, args)
+
+    topology = DiffusionStageLifecycleTopology(
+        stage_ids=(ENCODE, DENOISE, DECODE), state_owning_stage_ids=(ENCODE, DENOISE)
+    )
+    coordinator = DiffusionStageLifecycleCoordinator(topology, ExplodingRPC(workers).rpc)
+
+    with pytest.raises(SessionLifecycleError, match="ConnectionResetError"):
+        asyncio.run(coordinator.admit("r0", SessionControls("A", reset=True)))
+
+    assert coordinator.live_sessions == {}
+    assert _closes(workers[ENCODE], "A") == 1
+
+
+def test_capacity_eviction_followed_by_failure_does_not_resurrect_the_victim():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers, max_live_sessions=2)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    asyncio.run(_run_request(coordinator, workers, "r1", "B", reset=True))
+
+    # C is admitted and evicts A, then its own request fails.
+    asyncio.run(_run_request(coordinator, workers, "r2", "C", reset=True, success=False))
+
+    assert not coordinator.is_active("A")
+    assert not coordinator.is_active("C")
+    assert coordinator.is_active("B")
+    with pytest.raises(SessionNotLiveError):
+        asyncio.run(coordinator.admit("r3", SessionControls("A")))
+
+
+def test_a_failed_release_event_ack_keeps_the_events_pending():
+    workers = _edd_workers(capacity=1)
+
+    class AckRefusingWorker(FakeStageWorker):
+        def _dispatch(self, method, args):
+            if method == "ack_ar_diffusion_release_events":
+                self.calls.append((method, args))
+                return {"supported": False, "error": "ack transport down"}
+            return super()._dispatch(method, args)
+
+    workers[DENOISE] = AckRefusingWorker(DENOISE)
+    workers[DENOISE].capacity = 1
+    coordinator = _coordinator(workers)
+
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    with pytest.raises(SessionLifecycleError, match="ack transport down"):
+        asyncio.run(_run_request(coordinator, workers, "r1", "B", reset=True))
+
+    # Unacknowledged, so recovery still sees them.
+    assert workers[DENOISE].log.pending_count() >= 1
+    assert coordinator.blocked_reason is not None
+
+
+def test_an_empty_stage_reply_is_not_an_acknowledgement():
+    workers = _edd_workers()
+
+    class EmptyReplyRuntime(FakeTopologyRuntime):
+        async def rpc(self, method, stage_id, args):
+            if method == "register_ar_diffusion_generation" and stage_id == DECODE:
+                # No live replica answered.
+                return []
+            return await super().rpc(method, stage_id, args)
+
+    topology = DiffusionStageLifecycleTopology(
+        stage_ids=(ENCODE, DENOISE, DECODE), state_owning_stage_ids=(ENCODE, DENOISE)
+    )
+    coordinator = DiffusionStageLifecycleCoordinator(topology, EmptyReplyRuntime(workers).rpc)
+
+    with pytest.raises(SessionLifecycleError, match="empty reply"):
+        asyncio.run(coordinator.admit("r0", SessionControls("A", reset=True)))
+    assert coordinator.live_sessions == {}
+
+
+def test_cancellation_during_registration_leaves_no_orphan_and_frees_the_gate():
+    workers = _edd_workers()
+
+    class HangingRuntime(FakeTopologyRuntime):
+        async def rpc(self, method, stage_id, args):
+            if method == "register_ar_diffusion_generation" and stage_id == DENOISE:
+                await asyncio.sleep(10)
+            return await super().rpc(method, stage_id, args)
+
+    topology = DiffusionStageLifecycleTopology(
+        stage_ids=(ENCODE, DENOISE, DECODE), state_owning_stage_ids=(ENCODE, DENOISE)
+    )
+    coordinator = DiffusionStageLifecycleCoordinator(topology, HangingRuntime(workers).rpc)
+
+    async def scenario():
+        task = asyncio.create_task(coordinator.admit("r0", SessionControls("A", reset=True)))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The gate is free and nothing orphaned.
+        assert coordinator.live_sessions == {}
+        await coordinator.admit("r1", SessionControls("B", reset=True))
+        await coordinator.complete("r1", success=True)
+
+    asyncio.run(scenario())
+    assert coordinator.is_active("B")

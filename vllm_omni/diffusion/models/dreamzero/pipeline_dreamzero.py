@@ -315,6 +315,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def ar_diffusion_warmup_requests(self, session_id: str) -> Iterable[OmniDiffusionRequest]:
         """Yield DreamZero-valid requests covering each resident window shape."""
+        warmup_sessions = getattr(self, "_warmup_session_ids", None)
+        if warmup_sessions is None:
+            warmup_sessions = set()
+            self._warmup_session_ids = warmup_sessions
+        warmup_sessions.add(str(session_id or "default"))
         spec = self.ar_diffusion_kv_cache_spec()
         n_forwards = 1 + math.ceil(max(0, spec.window_frames - 1) / spec.frames_per_block)
         raw_kv_config = getattr(self.od_config, "ar_diffusion_kv_config", None)
@@ -684,6 +689,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self._committed_progress: dict[str, _DreamZeroSessionProgress] = {}
         # Coordinator-issued generation per live session; empty when uncoordinated.
         self._session_generations: dict[str, int] = {}
+        # Warmup rollouts this pipeline generated itself; exempt from the
+        # mandatory-generation rule because no coordinator issued one.
+        self._warmup_session_ids: set[str] = set()
+        self._lifecycle_coordinated = bool(getattr(od_config, "coordinated_session_lifecycle", False))
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         # Opt-in: back per-session state with the shared SessionStateManager
@@ -870,6 +879,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             self._session_generations = generations
         generations[key] = int(generation)
         return True
+
+    def _is_warmup_session(self, session_id: str) -> bool:
+        """Whether this id belongs to a rollout this pipeline generated for warmup."""
+        warmup_sessions = getattr(self, "_warmup_session_ids", None)
+        return bool(warmup_sessions) and str(session_id or "default") in warmup_sessions
 
     def registered_session_generation(self, session_id: str) -> int:
         """The generation this stage accepts, or 0 when none was ever issued."""
@@ -2080,6 +2094,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if dummy is not None:
             return dummy
         payload = self._unpack_stage_payload(batch, DREAMZERO_BOUNDARY_DIT_TO_DECODE)
+        # The final stage fences too: actions from a retired rollout must not be
+        # returned to the client just because they reached the last hop.
+        self._authorize_decode_generation(payload)
         private = payload.private_scalar_fields
         # Missing embodiment or observation state would silently change action
         # denormalization or absolute joint targets; require both fields.
@@ -2250,6 +2267,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             boundary=DREAMZERO_BOUNDARY_DIT_TO_DECODE,
             scalar_fields={
                 "session_id": incoming.scalar("session_id"),
+                # Carried on so the final stage can reject a stale rollout too.
+                "generation": int(incoming.scalar("generation", 0)),
             },
             tensor_fields={
                 "video_latents": denoised.video_latents,
@@ -2282,15 +2301,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         no partially advanced bookkeeping: committed progress moves only in
         ``_commit_stage_progress``, once the chunk's work succeeded.
         """
-        # A payload from a generation this stage already replaced is late by
-        # definition; reject it before it can reset KV or touch model state.
-        registered = self.registered_session_generation(enc.session_id)
-        if registered and enc.generation and enc.generation != registered:
-            raise DreamZeroStaleRequestError(
-                f"DreamZero session {enc.session_id!r} payload belongs to generation "
-                f"{enc.generation} but this stage is registered for generation {registered}; "
-                "the rollout was reset or retired after the payload was produced."
-            )
+        self._authorize_generation(enc)
 
         committed = self._committed_progress.get(enc.session_id) or _DreamZeroSessionProgress()
 
@@ -2329,6 +2340,53 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 )
 
         return _DreamZeroAuthorization(new_epoch=new_epoch)
+
+    def _authorize_decode_generation(self, payload: DreamZeroStagePayload) -> None:
+        """Fence the trailing postprocess stage on the same generation."""
+        session_id = str(payload.scalar("session_id", "") or "default")
+        generation = int(payload.scalar("generation", 0))
+        registered = self.registered_session_generation(session_id)
+        if not bool(getattr(self, "_lifecycle_coordinated", False)) or self._is_warmup_session(session_id):
+            return
+        if not registered or generation != registered:
+            raise DreamZeroStaleRequestError(
+                f"DreamZero session {session_id!r} decode payload belongs to generation "
+                f"{generation} but this stage is registered for generation {registered}; "
+                "the rollout was reset or retired, so its actions are not returned."
+            )
+
+    def _authorize_generation(self, enc: _DreamZeroEncoded) -> None:
+        """Reject a payload that does not belong to this stage's live rollout.
+
+        On a coordinated topology the generation is mandatory: a missing or zero
+        one means the coordinator never registered this rollout here, which is
+        exactly the state a stale or unrouted payload arrives in. Warmup rollouts
+        this pipeline generated itself, and uncoordinated single-stage runs, are
+        the only exemptions.
+        """
+        registered = self.registered_session_generation(enc.session_id)
+        coordinated = bool(getattr(self, "_lifecycle_coordinated", False))
+        if coordinated and not self._is_warmup_session(enc.session_id):
+            if not registered:
+                raise DreamZeroStaleRequestError(
+                    f"DreamZero session {enc.session_id!r} has no registered generation on this "
+                    "stage, so this payload cannot be attributed to a live rollout. The "
+                    "coordinator registers a generation on every participant before admitting a "
+                    "request; a payload without one is stale or was routed to the wrong stage."
+                )
+            if enc.generation != registered:
+                raise DreamZeroStaleRequestError(
+                    f"DreamZero session {enc.session_id!r} payload belongs to generation "
+                    f"{enc.generation} but this stage is registered for generation {registered}; "
+                    "the rollout was reset or retired after the payload was produced."
+                )
+            return
+        if registered and enc.generation and enc.generation != registered:
+            raise DreamZeroStaleRequestError(
+                f"DreamZero session {enc.session_id!r} payload belongs to generation "
+                f"{enc.generation} but this stage is registered for generation {registered}; "
+                "the rollout was reset or retired after the payload was produced."
+            )
 
     def _commit_stage_progress(self, enc: _DreamZeroEncoded) -> None:
         """Record committed progress once the chunk's denoise and KV commit ran."""

@@ -1985,7 +1985,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # A continuation whose window state is gone here -- but not on encode --
         # is the case where only one participant lost its state. Refuse it before
         # creating replacement bookkeeping that would look like a fresh window.
-        if encoded.reset_reason is None and not self.has_session_state(session_id):
+        # A window start legitimately rebuilds conditioning from scratch (that is
+        # what warmup's first forward does), so it may create its own state; a
+        # stale window start is caught by generation fencing instead.
+        if not encoded.window_start and encoded.reset_reason is None and not self.has_session_state(session_id):
             raise SessionStateLostError(self._session_state_lost_message(str(session_id or "default")))
         state = self._get_or_create_state(session_id)
         self.state = state

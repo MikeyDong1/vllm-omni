@@ -179,11 +179,10 @@ class RobotRealtimeConnection:
         self._current_session_id: str | None = None
         # Session ids seen on this connection, most-recently-used last.
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
-        # Ownership policy: this connection holds a reference on every session
-        # it began, and drops it on reset, tracking eviction, or disconnect.
-        # ``ServingRealtimeRobotOpenPI`` reference-counts those holds, so a
-        # session id shared by several sockets is only closed once the last of
-        # them is gone -- one client disconnecting never ends another's rollout.
+        # Ownership: this connection holds a reference on every session it
+        # began and drops it on reset, tracking eviction, or disconnect. Serving
+        # reference-counts the holds, so a shared id closes only when the last
+        # connection using it is gone.
         self._release_sessions_on_disconnect = release_sessions_on_disconnect
         self._held_sessions: set[str] = set()
 
@@ -213,9 +212,8 @@ class RobotRealtimeConnection:
         """Record ``session_id``; return True when it is the first sighting.
 
         A session's first observation is the one that carries ``reset`` to the
-        policy, so this needs per-session memory. Dropping a tracked id would
-        make a later message for it look like a fresh rollout, so the evicted
-        session's model state is released rather than silently abandoned.
+        policy, so this needs per-session memory. An evicted id would look like a
+        fresh rollout later, so its model state is released with it.
         """
         if session_id in self._seen_sessions:
             self._seen_sessions.move_to_end(session_id)
@@ -317,8 +315,7 @@ class RobotRealtimeConnection:
                         )
                         await self.websocket.send_bytes(_pack(actions))
                         if close_session:
-                            # The rollout ended with this chunk: drop this
-                            # connection's hold so the id can be reused.
+                            # The rollout ended; drop the hold so the id is reusable.
                             await self._release_session(session_id)
                             self._seen_sessions.pop(session_id, None)
                             if self._current_session_id == session_id:
@@ -335,7 +332,7 @@ class RobotRealtimeConnection:
         except Exception:
             logger.exception("Connection error")
         finally:
-            # Disconnect, idle timeout and internal error all land here: a
+            # Disconnect, idle timeout and internal error all land here; a
             # rollout this connection began must not outlive it.
             if self._release_sessions_on_disconnect:
                 await self._release_held_sessions()

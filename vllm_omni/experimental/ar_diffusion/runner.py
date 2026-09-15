@@ -73,9 +73,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
         # modes instead of one entry per denoise step.
         self._stepwise_chunk_started: dict[str, float] = {}
-        # A stage in a coordinated topology reports releases upward and lets the
-        # orchestrator own reset/close ordering; a single-stage deployment keeps
-        # performing its own request-driven cleanup.
+        # A coordinated stage reports releases upward and lets the orchestrator
+        # own reset/close ordering; a single-stage deployment does its own.
         self.lifecycle_externally_coordinated = bool(getattr(od_config, "coordinated_session_lifecycle", False))
         stage_id = getattr(od_config, "stage_id", None)
         self.release_events = ARDiffusionReleaseEventLog(
@@ -101,8 +100,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._preallocate_kv_cache()
         if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
             self._warmup_ar_rollout()
-        # Warmup drives real rollouts and releases them again; those are not
-        # user sessions, so start reporting releases only once it is done.
+        # Warmup releases real rollouts, but they are not user sessions.
         self.release_events.set_ready()
 
     def _available_memory_bytes(self) -> int:
@@ -221,8 +219,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
                 errors.append(exc)
         logger.debug("AR-Diffusion released session=%s reason=%s", session_id, reason)
-        # Record before raising: peers must learn that this stage dropped the
-        # session even when local cleanup only partly succeeded.
+        # Record before raising: peers must learn this stage dropped the session
+        # even when local cleanup only partly succeeded.
         self.release_events.record(session_id, reason=reason, cleanup_failed=bool(errors))
         if errors:
             if suppress_errors:
@@ -243,8 +241,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def close_session(self, session_id: str) -> None:
         """Release KV and notify the pipeline to drop model-owned state."""
         self._release_session(session_id, reset_model=False, reason="close")
-
-    # -- coordinated lifecycle surface (collective RPC) ---------------------
 
     def suppress_release_events(self, session_id: str):
         """Context manager marking a release as coordinator-driven."""
@@ -270,13 +266,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def _reject_unknown_continuation(self, session_id: str, *, reset: bool) -> None:
         """Refuse a continuation of a session this runner no longer holds.
 
-        Without this, ``_get_or_create_session`` would evict a healthy session to
-        make room for the unknown one, and only then would the pipeline reject the
-        request -- costing a live rollout its KV for nothing.
-
-        Opt-in: only a topology whose lifecycle is coordinated can rely on the
-        coordinator having already retired anything it released, so other
-        deployments keep the previous create-on-demand behavior.
+        Otherwise ``_get_or_create_session`` evicts a healthy session to make
+        room for the unknown one, and only then does the pipeline reject the
+        request. Opt-in, since only a coordinated topology can rely on the
+        coordinator having already retired what it released.
         """
         if reset or not self.lifecycle_externally_coordinated:
             return
@@ -379,11 +372,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-        # On a coordinated topology the orchestrator has already retired the old
-        # generation on every participant before this request was admitted, and
-        # it performs the post-request close itself. Repeating either here would
-        # discard the conditioning the upstream stage just produced (reset) or
-        # race the coordinator's own acknowledgement (close). The model-level
+        # The orchestrator already retired the old generation before admission
+        # and closes after the request itself; repeating the reset here would
+        # discard the conditioning the upstream stage just produced. The
         # begin/reset intent still reaches the pipeline through extra_args.
         if reset and not self.lifecycle_externally_coordinated:
             self.reset_session(session_id)

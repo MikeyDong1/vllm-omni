@@ -39,9 +39,8 @@ M = TypeVar("M", bound=StateObject)
 class SessionStateLostError(RuntimeError):
     """A continuation has no resident history; an explicit new session is required.
 
-    Raised by a model's stage-local lookup, as opposed to a coordinator's view of
-    which sessions are active: only the stage that owns the history can tell
-    whether it is actually still there.
+    Raised by a model's stage-local lookup: only the stage owning the history can
+    tell whether it is still there.
     """
 
 

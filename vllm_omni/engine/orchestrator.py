@@ -93,9 +93,8 @@ from vllm_omni.outputs.duplex import attach_duplex_output_decision
 logger = init_logger(__name__)
 
 
-# Upper bound on one coordinated session lifecycle RPC. Cleanup runs on request
-# teardown paths, so a wedged worker must surface as a failure rather than stall
-# the orchestrator; the coordinator then blocks reuse until recovery.
+# Cleanup runs on teardown paths, so a wedged worker must surface as a failure
+# instead of stalling the orchestrator.
 _SESSION_LIFECYCLE_RPC_TIMEOUT_S = 30.0
 
 
@@ -531,8 +530,8 @@ class Orchestrator:
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
 
-        # Opt-in cross-stage session lifecycle (declared per stage by the
-        # topology). Absent for every pipeline that does not ask for it.
+        # Opt-in cross-stage session lifecycle, declared per stage by the
+        # topology; absent for every pipeline that does not ask for it.
         self._session_lifecycle: DiffusionStageLifecycleCoordinator | None = None
         lifecycle_topology = DiffusionStageLifecycleTopology.from_stage_configs(stage_configs or [])
         if lifecycle_topology is not None:
@@ -550,9 +549,8 @@ class Orchestrator:
     async def _stage_lifecycle_rpc(self, method: str, stage_id: int, args: tuple[Any, ...]) -> list[Any]:
         """Run one lifecycle RPC against a stage's live replicas.
 
-        Called from orchestrator callbacks, so it dispatches to the stage pools
-        directly rather than enqueueing a collective RPC back to this same
-        orchestrator and waiting on itself.
+        Dispatches to the stage pools directly: enqueueing a collective RPC back
+        to this same orchestrator would wait on itself.
         """
         if not (0 <= stage_id < self.num_stages):
             raise ValueError(f"lifecycle RPC target stage {stage_id} is out of range")
@@ -563,8 +561,7 @@ class Orchestrator:
                 await pool.collective_rpc(
                     replica_id=replica_id,
                     method=method,
-                    # Bounded so a wedged worker cannot hang a teardown path; a
-                    # timeout surfaces as a cleanup failure, which blocks reuse.
+                    # A timeout surfaces as a cleanup failure, which blocks reuse.
                     timeout=_SESSION_LIFECYCLE_RPC_TIMEOUT_S,
                     args=args,
                 )
@@ -579,17 +576,15 @@ class Orchestrator:
     ) -> bool:
         """Take the topology's admission slot; False when the request was failed.
 
-        Waits on the coordinator's gate, which queues this request behind the
-        one in flight. That parks the request-handler task, not the event loop:
-        stage outputs are polled by a separate task, so the in-flight request
-        still completes and releases the slot.
+        The coordinator's gate queues this request behind the one in flight. That
+        parks the request-handler task, not the event loop -- stage outputs are
+        polled by a separate task, so the in-flight request still completes.
         """
         coordinator = self._session_lifecycle
         if coordinator is None:
             return True
         controls = read_session_controls(sampling_params_list)
         if controls is None:
-            # A request without session controls does not participate.
             return True
         try:
             generation = await coordinator.admit(request_id, controls)
@@ -622,9 +617,8 @@ class Orchestrator:
     async def _complete_session_lifecycle(self, request_ids: Sequence[str], *, success: bool) -> None:
         """Close out coordinated lifecycle for finished ids and reopen admission.
 
-        A failure here has already blocked further admission inside the
-        coordinator, so it is reported rather than raised: the request being
-        torn down is finished either way, and letting it escape would abort an
+        A failure here already blocked further admission inside the coordinator,
+        so it is reported rather than raised: letting it escape would abort an
         orchestrator teardown path.
         """
         coordinator = self._session_lifecycle
@@ -873,10 +867,10 @@ class Orchestrator:
             await self._fail_request_dead_stage(request_id, stage_id)
             return
 
-        # Order this request against the rest of the topology before anything is
-        # submitted: a reset must not reach encode while the previous request is
-        # still denoising, and a continuation of a session whose state is gone
-        # must fail here rather than half-apply across the stages.
+        # Order this request against the topology before anything is submitted:
+        # a reset must not reach encode while the previous request is still
+        # denoising, and a continuation with no state must fail before it
+        # half-applies across the stages.
         if not await self._admit_session_lifecycle(request_id, stage_id, sampling_params_list):
             return
 
@@ -1717,9 +1711,8 @@ class Orchestrator:
         )
         pool.evict_replica(replica_id)
         self._remove_stage_replica_waiting(stage_id, replica_id)
-        # A dead lifecycle participant took its paged KV with it, and its pending
-        # release events can no longer be retrieved. No session that spanned it
-        # may be continued, so invalidate them all and clean what is reachable.
+        # A dead participant took its paged KV with it and can no longer report
+        # its release events, so nothing that spanned it may continue.
         if self._session_lifecycle is not None and stage_id in self._session_lifecycle.topology.stage_ids:
             await self._session_lifecycle.invalidate_all(reason=f"stage-{stage_id} replica-{replica_id} died")
         stage_has_live = bool(pool.live_replica_ids())
@@ -1976,12 +1969,10 @@ class Orchestrator:
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
-        # Every teardown and completion path funnels through here, so this is
-        # where coordinated lifecycle is settled: worker-reported releases are
-        # drained and replayed onto the peer stages, an aborted or errored
-        # generation is invalidated everywhere, and only then is the next
-        # topology request admitted. Aborts arrive with ``abort=True``, which is
-        # exactly the set of paths that must invalidate rather than preserve.
+        # Every teardown and completion path funnels through here, so coordinated
+        # lifecycle settles here too: releases are replayed onto the peers before
+        # the next topology request is admitted. ``abort=True`` is exactly the
+        # set of paths whose generation must be invalidated rather than kept.
         await self._complete_session_lifecycle(cleanup_ids, success=not abort)
         return abort_outputs
 

@@ -6,12 +6,9 @@
 Flow: raw obs → engine request → actions.
 The loaded policy model owns dataset transforms inside its pipeline.
 
-A policy may be deployed as one diffusion stage or split across several
-(encode / denoise / decode). ``AsyncOmni.generate()`` requires exactly one
-sampling-parameter object per configured stage, so this layer reads the
-initialized topology and builds that list, giving every participant the same
-normalized session identity and only the encode-side stages the raw
-observation.
+``generate()`` needs one sampling-params object per configured stage, so this
+layer reads the initialized topology: every participant gets the same normalized
+session identity, only the encode-side stages get the raw observation.
 """
 
 from __future__ import annotations
@@ -31,8 +28,7 @@ logger = init_logger(__name__)
 
 ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
-# Roles that run the observation encoders and therefore need the raw obs.
-# Every other role consumes the upstream stage payload instead.
+# Roles running the observation encoders; the rest read the stage payload.
 _OBSERVATION_ROLES = frozenset({"full", "encode"})
 
 
@@ -85,10 +81,9 @@ def _stage_type_name(stage_config: Any) -> str:
 def _resolve_stage_roles(engine_client: Any) -> tuple[str | None, ...]:
     """Read one diffusion role per configured stage from the live topology.
 
-    ``None`` marks a non-diffusion stage: it takes its own defaults unchanged
-    and receives no policy controls. A deployment that exposes no stage configs
-    (single-stage engines, lightweight test doubles) resolves to one ``full``
-    stage, which is the historical single-stage behavior.
+    ``None`` marks a non-diffusion stage, which keeps its own defaults and takes
+    no policy controls. No stage configs resolves to one ``full`` stage, i.e.
+    the historical single-stage behavior.
     """
     from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 
@@ -105,8 +100,8 @@ def _resolve_stage_roles(engine_client: Any) -> tuple[str | None, ...]:
     for index in range(stage_count):
         stage_config = stage_configs[index] if index < len(stage_configs) else None
         if stage_config is None:
-            # No config for this index: assume the diffusion policy stage so a
-            # single-stage engine without stage_configs still gets its controls.
+            # Assume the policy stage so a single-stage engine without
+            # stage_configs still gets its controls.
             roles.append("full" if stage_count == 1 else None)
             continue
         if _stage_type_name(stage_config) != "diffusion":
@@ -124,9 +119,8 @@ def _resolve_stage_roles(engine_client: Any) -> tuple[str | None, ...]:
 class _PolicyRequest:
     """One OpenPI inference request plus its per-stage sampling parameters.
 
-    ``sampling_params_list[0]`` is the object carried by ``request``, so the
-    seed that ``OmniDiffusionRequest`` assigns to an unseeded request is the
-    one mirrored onto the remaining stages.
+    ``sampling_params_list[0]`` is the object ``request`` carries, so the seed
+    ``OmniDiffusionRequest`` assigns is the one mirrored onto the other stages.
     """
 
     request: Any
@@ -161,8 +155,8 @@ class ServingRealtimeRobotOpenPI:
         self.policy_server_config = self._get_policy_server_config(engine_client)
         self._request_counter = count()
         self.stage_roles = _resolve_stage_roles(engine_client)
-        # Reference count of connections holding each live session id, so a
-        # session shared by several sockets survives one of them disconnecting.
+        # Connections holding each live session id, so one socket disconnecting
+        # does not close a session another is still driving.
         self._session_refcounts: Counter[str] = Counter()
 
     @property
@@ -221,9 +215,7 @@ class ServingRealtimeRobotOpenPI:
     async def release_session(self, session_id: str) -> bool:
         """Drop one connection's hold on ``session_id``; close it when last out.
 
-        Returns True when this call actually released model-side state. A
-        session held by another live connection is left alone, so one socket
-        disconnecting never closes a rollout another socket is still driving.
+        True when this call actually released model-side state.
         """
         key = str(session_id)
         remaining = self._session_refcounts.get(key, 0) - 1
@@ -248,8 +240,7 @@ class ServingRealtimeRobotOpenPI:
     def drop_session(self, session_id: str) -> Any:
         """Best-effort release of model-side session state for a closed rollout.
 
-        Returns whatever the underlying hook returned so an async engine hook
-        can be awaited by ``close_session``.
+        Returns the hook's result so ``close_session`` can await an async hook.
         """
         drop = getattr(self.engine_client, "drop_session", None)
         if callable(drop):
@@ -341,10 +332,9 @@ class ServingRealtimeRobotOpenPI:
     ) -> tuple[str, bool, bool]:
         """Resolve session identity and lifecycle intent once for every stage.
 
-        A typed ``ar_diffusion_tick`` is authoritative, matching the runner's
-        own precedence: its ``reset``/``close_session`` replace the flat
-        controls rather than being OR-ed with them, so a typed ``False`` cannot
-        be overridden by a stale flat ``True`` left in a stage default.
+        A typed tick is authoritative, matching the runner: its controls replace
+        the flat ones rather than being OR-ed, so a typed ``False`` cannot be
+        overridden by a stale ``True`` left in a stage default.
         """
         from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
@@ -363,11 +353,9 @@ class ServingRealtimeRobotOpenPI:
     ) -> _PolicyRequest:
         """Build engine request and per-stage sampling params from raw robot obs.
 
-        Every configured diffusion stage gets its own parameter object cloned
-        from that stage's initialized defaults, so a deploy yaml's per-stage
-        ``extra_args`` (denoising settings, seeds, connector hints) survive.
-        Only the encode-side roles receive the raw observation; the others read
-        the upstream stage payload.
+        Each diffusion stage gets its own clone of that stage's initialized
+        defaults, so a deploy yaml's per-stage ``extra_args`` survive. Only the
+        encode-side roles receive the raw observation.
         """
         from vllm import SamplingParams
 
@@ -377,15 +365,13 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         seed = obs.pop("seed", None)
-        # A direct caller may drive the rollout with a typed tick instead of the
-        # flat controls; keep it out of the observation and on extra_args.
+        # A direct caller may drive the rollout with a typed tick; keep it on
+        # extra_args rather than in the observation.
         typed_tick = obs.pop(AR_DIFFUSION_TICK_KEY, None)
 
-        # The engine applies stage default_sampling_params only to requests
-        # that carry no explicit params; this endpoint always passes explicit
-        # params, so start from a clone of each stage's defaults (e.g. a policy
-        # deploy yaml's ``extra_args``) and layer the OpenPI protocol fields on
-        # top of the clone.
+        # The engine applies stage defaults only to requests without explicit
+        # params, and this endpoint always passes them, so start from a clone of
+        # each stage's defaults and layer the protocol fields on top.
         templates = self._stage_default_params()
         sampling_params_list: list[Any] = []
         resolved_session_id = str(session_id)
@@ -396,15 +382,14 @@ class ServingRealtimeRobotOpenPI:
         for index, role in enumerate(self.stage_roles):
             template = templates[index]
             if role is None:
-                # A non-diffusion stage keeps its own parameter type and takes
-                # no policy controls; clone so the defaults stay untouched.
+                # Keeps its own parameter type and takes no policy controls.
                 sampling_params_list.append(
                     clone_sampling_params(template) if template is not None else SamplingParams()
                 )
                 continue
             if isinstance(template, OmniDiffusionSamplingParams):
-                # clone_sampling_params deep-copies, so each stage owns its own
-                # extra_args mapping and the engine defaults stay untouched.
+                # A deep copy, so no two stages share an extra_args mapping and
+                # the engine defaults are never mutated.
                 params = clone_sampling_params(template)
             else:
                 params = OmniDiffusionSamplingParams()
@@ -427,9 +412,8 @@ class ServingRealtimeRobotOpenPI:
             if role in _OBSERVATION_ROLES:
                 extra_args["robot_obs"] = obs
             else:
-                # Denoise and postprocess read the upstream stage payload; a
-                # copy of the observation here would be transferred for nothing
-                # and could drift from what encode actually consumed.
+                # These read the stage payload; a second copy of the observation
+                # would ship for nothing and could drift from what encode used.
                 extra_args.pop("robot_obs", None)
             params.extra_args = extra_args
             if seed is not None:
@@ -444,9 +428,8 @@ class ServingRealtimeRobotOpenPI:
             sampling_params=sampling_params_list[0],
             request_id=self._next_request_id(resolved_session_id),
         )
-        # OmniDiffusionRequest auto-seeds an unseeded request. Mirror the
-        # resolved seed onto the other stages so every participant derives the
-        # same generator state instead of seeding itself independently.
+        # OmniDiffusionRequest auto-seeds an unseeded request; mirror that seed
+        # so every participant derives the same generator state.
         resolved_seed = getattr(request.sampling_params, "seed", None)
         for params in sampling_params_list[1:]:
             if getattr(params, "seed", None) is None:

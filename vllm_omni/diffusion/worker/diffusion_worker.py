@@ -601,10 +601,9 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
-    # Runner lifecycle method -> the optional pipeline hook that stands in for it
-    # when this stage has no AR runner (a plain diffusion runner on encode has no
-    # reset_session/close_session, so broadcasting the RPC alone would silently
-    # do nothing on the stage that owns the VAE history).
+    # Runner lifecycle method -> the pipeline hook standing in for it on a stage
+    # with no AR runner. A plain diffusion runner has no reset_session, so the
+    # RPC alone did nothing on the stage owning the VAE history.
     _AR_LIFECYCLE_PIPELINE_HOOKS = {
         "reset_session": "reset_ar_diffusion_session",
         "close_session": "close_ar_diffusion_session",
@@ -613,11 +612,10 @@ class DiffusionWorker:
     def _run_ar_diffusion_session_lifecycle(self, method: str, session_id: str) -> bool:
         """Run one session lifecycle operation on whatever owns state here.
 
-        The AR runner is preferred: it releases paged KV before notifying the
-        local model. A stage without one falls back to the model's own hook, so
-        every state-owning participant responds to the same RPC. Returns False
-        for a stage that implements neither -- the caller treats that as an
-        unsupported participant rather than a successful cleanup.
+        Prefers the AR runner, which releases paged KV before notifying the local
+        model, and otherwise falls back to the model's own hook so every
+        state-owning participant answers the same RPC. False means the stage
+        implements neither, which the caller treats as unsupported.
         """
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a non-empty string.")
@@ -625,8 +623,7 @@ class DiffusionWorker:
         runner = self.model_runner
 
         suppress = getattr(runner, "suppress_release_events", None)
-        # This release is coordinator-driven; recording it would make the
-        # coordinator fan the same cleanup out again.
+        # Coordinator-driven, so recording it would fan the same cleanup out again.
         with suppress(session_id) if callable(suppress) else nullcontext():
             lifecycle_method = getattr(runner, method, None)
             if callable(lifecycle_method):

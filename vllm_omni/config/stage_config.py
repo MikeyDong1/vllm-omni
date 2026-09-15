@@ -310,10 +310,8 @@ class StagePipelineConfig:
     stage_input_payload_keys: tuple[str, ...] = ()
     # Declared send payload keys for diffusion producers; empty disables sending.
     stage_output_payload_keys: tuple[str, ...] = ()
-    # Opt in to topology-coordinated session lifecycle: the orchestrator owns
-    # reset/close/eviction ordering across these stages, and each stage's runner
-    # stops performing its own request-driven global cleanup. Leave False for
-    # single-stage deployments, which keep the runner-local behavior.
+    # Opt in to orchestrator-owned reset/close/eviction ordering across these
+    # stages; each runner then stops doing its own request-driven cleanup.
     coordinated_session_lifecycle: bool = False
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None

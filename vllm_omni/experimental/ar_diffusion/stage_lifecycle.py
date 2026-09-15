@@ -2,27 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Topology-wide session lifecycle ordering for a disaggregated AR pipeline.
 
-A session split across stages has its state in more than one place: the encode
-stage owns the VAE observation history, the denoise stage owns paged KV and its
-own window bookkeeping, and a trailing postprocess stage owns nothing. Each of
-those was previously released independently, so an eviction inside the denoise
-runner left the encoder still holding history for a session whose KV was gone --
-the next continuation then encoded against stale history.
+A split session keeps state on several stages (encode owns VAE history, denoise
+owns paged KV), and each stage used to release its own independently, so an
+eviction in denoise left encode conditioning on history whose KV was gone.
 
-This coordinator owns the ordering instead:
-
-* one end-to-end request in flight across the topology, so a request cannot
-  enter encode while another is evicting its session in denoise;
-* a coordinator-issued, globally increasing generation per begin/reset, carried
-  by every participant so late payloads and late release events from an earlier
-  generation are rejected rather than applied;
-* explicit reset/close fanned out once, at the topology boundary, instead of
-  each stage repeating a global cleanup;
-* self-initiated releases (LRU eviction, failed forward) drained back from the
-  workers at every request boundary and replayed onto the peer stages.
-
-The class is transport-agnostic: it is handed an async ``rpc`` callable and
-never imports the orchestrator, so it is exercised directly on CPU.
+This coordinator owns the ordering: one end-to-end request in flight, one
+generation per begin/reset registered on every participant, reset/close fanned
+out once at the topology boundary, and worker-initiated releases drained back
+and replayed onto the peers. It takes an async ``rpc`` callable rather than
+importing the orchestrator, so it runs directly on CPU.
 """
 
 from __future__ import annotations
@@ -39,9 +27,8 @@ from vllm_omni.experimental.ar_diffusion.release_events import ARDiffusionReleas
 
 logger = init_logger(__name__)
 
-# Roles holding per-session state. A trailing postprocess stage is stateless: it
-# still takes part in lifecycle RPC (so an unsupported participant is visible)
-# but owns nothing to retire.
+# Roles holding per-session state; a trailing postprocess stage owns nothing to
+# retire but still takes part in lifecycle RPC.
 _STATE_OWNING_ROLES = frozenset({"full", "encode", "denoise", "denoise_decode"})
 
 DEFAULT_MAX_LIVE_SESSIONS = 64
@@ -55,11 +42,10 @@ class SessionLifecycleError(RuntimeError):
 
 
 class SessionNotLiveError(SessionLifecycleError):
-    """A continuation refers to a session whose state no longer exists.
+    """A continuation refers to a session this topology no longer tracks.
 
-    Recovery is an explicit new rollout: the caller must send a begin/reset.
-    Reconstructing VAE history from a later chunk is not possible, so this is
-    raised before any stage mutates counters, history or KV.
+    VAE history cannot be rebuilt from a later chunk, so recovery is an explicit
+    new rollout. Raised before any stage mutates counters, history or KV.
     """
 
 
@@ -75,12 +61,9 @@ class SessionControls:
 def read_session_controls(sampling_params_list: Sequence[Any]) -> SessionControls | None:
     """Read session controls from a request's per-stage sampling params.
 
-    Returns ``None`` for a request that carries none, which is how a
-    non-session workload sharing the same engine opts out.
-
-    A typed ``ar_diffusion_tick`` is authoritative over the flat controls,
-    matching the runner: a typed ``False`` is not overridden by a stale flat
-    ``True``.
+    ``None`` means the request carries none, which is how a non-session workload
+    on the same engine opts out. A typed tick wins over the flat controls,
+    matching the runner: a typed ``False`` is not overridden by a stale ``True``.
     """
     from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
@@ -142,8 +125,8 @@ class _InFlight:
     session_id: str
     generation: int
     close_session: bool
-    # Sessions this request's admission already retired, so a release event for
-    # them is expected and must not look like a surprise eviction.
+    # Retired by this request's own admission, so their release events are
+    # expected and must not be fanned out again.
     coordinated_sessions: set[str] = field(default_factory=set)
 
 
@@ -164,16 +147,13 @@ class DiffusionStageLifecycleCoordinator:
         self._rpc = rpc
         self._replica_count = replica_count
         self._max_live_sessions = int(max_live_sessions)
-        # Bounded live registry; the generation counter is global and monotonic,
-        # so a reused id never inherits an earlier generation and no tombstone
-        # dictionary is needed.
+        # Bounded registry; the generation counter is global and monotonic, so a
+        # reused id never inherits an earlier generation and needs no tombstone.
         self._live: OrderedDict[str, int] = OrderedDict()
         self._next_generation = 0
         self._gate = asyncio.Lock()
         self._inflight: _InFlight | None = None
         self._blocked_reason: str | None = None
-
-    # -- observability ---------------------------------------------------
 
     @property
     def live_sessions(self) -> dict[str, int]:
@@ -193,8 +173,6 @@ class DiffusionStageLifecycleCoordinator:
         """Allow admission again after an operator-level recovery."""
         self._blocked_reason = None
 
-    # -- RPC helpers -----------------------------------------------------
-
     async def _call(self, method: str, stage_ids: Iterable[int], *args: Any) -> dict[int, Any]:
         results: dict[int, Any] = {}
         for stage_id in stage_ids:
@@ -203,7 +181,7 @@ class DiffusionStageLifecycleCoordinator:
 
     @staticmethod
     def _collect_support(value: Any, *, errors: list[str], supported: list[bool]) -> None:
-        """Flatten per-replica/per-rank RPC results into support and error lists."""
+        """Flatten per-replica/per-rank results into support and error lists."""
         if isinstance(value, bool):
             supported.append(value)
             return
@@ -238,7 +216,7 @@ class DiffusionStageLifecycleCoordinator:
             )
 
     def _require_single_replica_layout(self) -> None:
-        """Session-affine routing does not exist yet, so refuse a fan-out layout."""
+        """Refuse a multi-replica layout until session-affine routing exists."""
         if self._replica_count is None:
             return
         for stage_id in self.topology.stage_ids:
@@ -255,8 +233,6 @@ class DiffusionStageLifecycleCoordinator:
                     "the session's state cannot be reached."
                 )
 
-    # -- registry --------------------------------------------------------
-
     def _new_generation(self, session_id: str) -> int:
         self._next_generation += 1
         generation = self._next_generation
@@ -268,7 +244,7 @@ class DiffusionStageLifecycleCoordinator:
         self._live.pop(str(session_id), None)
 
     async def _evict_oldest_if_needed(self) -> None:
-        """Keep the live registry bounded by retiring the oldest session properly."""
+        """Keep the registry bounded, retiring the oldest through the fan-out."""
         while len(self._live) > self._max_live_sessions:
             victim, _ = next(iter(self._live.items()))
             logger.warning(
@@ -283,15 +259,12 @@ class DiffusionStageLifecycleCoordinator:
                 self.topology.state_owning_stage_ids,
             )
 
-    # -- admission -------------------------------------------------------
-
     async def admit(self, request_id: str, controls: SessionControls) -> int:
         """Order one request against the topology and return its generation.
 
-        Blocks until the previous end-to-end request has finished and its
-        lifecycle acknowledgements are in. Raises before any stage is mutated
-        when the request cannot be served safely; the caller must then report
-        the error and must not submit the request.
+        Blocks until the previous end-to-end request finished and acknowledged
+        its cleanup. Raises before any stage is mutated when the request cannot
+        be served; the caller must then fail it instead of submitting it.
         """
         await self._gate.acquire()
         try:
@@ -304,8 +277,8 @@ class DiffusionStageLifecycleCoordinator:
             coordinated: set[str] = set()
 
             if controls.reset:
-                # Older work is already drained by the gate. Retire every
-                # participant once, here, so no downstream stage repeats it.
+                # The gate already drained older work; retire every participant
+                # once here so no downstream stage repeats it.
                 if session_id in self._live:
                     await self._retire_session(session_id, reason="coordinated_reset")
                     coordinated.add(session_id)
@@ -339,8 +312,7 @@ class DiffusionStageLifecycleCoordinator:
     async def _register_generation(self, session_id: str, generation: int) -> None:
         """Bind the generation on every participant before payload execution.
 
-        The stateless postprocess stage records identity only; nothing resident
-        is allocated for it.
+        Identity only, so the stateless postprocess stage allocates nothing.
         """
         results = await self._call("register_ar_diffusion_generation", self.topology.stage_ids, session_id, generation)
         for stage_id, value in results.items():
@@ -363,19 +335,15 @@ class DiffusionStageLifecycleCoordinator:
         )
         logger.info("Coordinated session %s retired across the topology (%s)", session_id, reason)
 
-    # -- completion ------------------------------------------------------
-
     async def complete(self, request_id: str, *, success: bool) -> None:
         """Close out one admitted request, then let the next one in.
 
-        Runs for a returned error and a raised exception alike: the release
-        events a worker recorded on either path must still be drained before
-        another request can reuse affected session state.
+        Runs for a returned error and a raised exception alike; either path can
+        leave release events that must drain before the state is reused.
         """
         inflight = self._inflight
         if inflight is None or inflight.request_id != str(request_id):
-            # Not the request holding the gate (already completed, or never
-            # admitted); nothing to release.
+            # Already completed, or never admitted; nothing holds the gate.
             return
         self._inflight = None
         try:
@@ -386,8 +354,8 @@ class DiffusionStageLifecycleCoordinator:
                 failures.append(str(exc))
 
             if not success:
-                # The affected generation is invalid on every participant; it is
-                # not retried as a continuation.
+                # The generation is invalid everywhere; never retried as a
+                # continuation.
                 try:
                     await self._retire_session(inflight.session_id, reason="request_failure")
                 except SessionLifecycleError as exc:
@@ -399,8 +367,8 @@ class DiffusionStageLifecycleCoordinator:
                     failures.append(str(exc))
 
             if failures:
-                # Cleanup did not complete: block reuse rather than report a
-                # synchronized success we did not achieve.
+                # Block reuse rather than report a synchronization we did not
+                # achieve.
                 self._blocked_reason = "; ".join(failures)
                 raise SessionLifecycleError(self._blocked_reason)
         finally:
@@ -414,11 +382,9 @@ class DiffusionStageLifecycleCoordinator:
     async def invalidate_all(self, *, reason: str) -> None:
         """Drop every live session and clean whatever peer state is reachable.
 
-        Used when a participant died: its KV did not survive the restart, so no
-        session that spanned it may be continued. This deliberately does not take
-        the admission gate -- it runs while the request that lost its worker is
-        still being torn down -- and it blocks admission when peer cleanup could
-        not be completed, rather than reporting a cleanup it did not achieve.
+        For a dead participant: its KV did not survive, so nothing that spanned
+        it may continue. Deliberately skips the admission gate, since it runs
+        while the request that lost its worker is still being torn down.
         """
         sessions = list(self._live)
         self._live.clear()
@@ -442,10 +408,8 @@ class DiffusionStageLifecycleCoordinator:
         if failures:
             self._blocked_reason = f"{reason}: " + "; ".join(failures)
 
-    # -- reverse path ----------------------------------------------------
-
     async def _drain_release_events(self, inflight: _InFlight) -> None:
-        """Replay worker-initiated releases onto the peer stages, then ack them."""
+        """Replay worker-initiated releases onto the peers, then acknowledge them."""
         stage_ids = self.topology.state_owning_stage_ids
         if not stage_ids:
             return
@@ -458,8 +422,6 @@ class DiffusionStageLifecycleCoordinator:
         for stage_id, value in raw.items():
             events, decode_errors = _decode_release_events(value)
             conflicts.extend(f"stage {stage_id}: {error}" for error in decode_errors)
-            # TP ranks of one replica report the same releases; agreeing records
-            # collapse, a disagreeing generation is an error.
             for event in events:
                 acks.setdefault(stage_id, []).append(event.event_id)
                 if event.cleanup_failed:
@@ -475,8 +437,8 @@ class DiffusionStageLifecycleCoordinator:
                     )
                     continue
                 if event.generation and registered is None:
-                    # The session is already retired here: an expected event
-                    # from a cleanup this coordinator drove, or a late duplicate.
+                    # Already retired here: a cleanup this coordinator drove, or
+                    # a late duplicate.
                     continue
                 previous = victims.get(event.session_id)
                 if previous is not None and event.generation and previous and previous != event.generation:
@@ -489,7 +451,6 @@ class DiffusionStageLifecycleCoordinator:
         retire_errors: list[str] = []
         for session_id in list(victims):
             if session_id in inflight.coordinated_sessions:
-                # Already handled at admission; do not rebroadcast.
                 continue
             if session_id == inflight.session_id:
                 logger.warning(
@@ -502,7 +463,7 @@ class DiffusionStageLifecycleCoordinator:
                 retire_errors.append(str(exc))
 
         if conflicts or retire_errors:
-            # Do not acknowledge: the events must survive for a retry.
+            # Leave them unacknowledged so a retry still sees them.
             raise SessionLifecycleError("; ".join(conflicts + retire_errors))
 
         for stage_id, event_ids in acks.items():
@@ -516,8 +477,8 @@ def _decode_release_events(value: Any) -> tuple[list[ARDiffusionReleaseEvent], l
     errors: list[str] = []
 
     def add(event: ARDiffusionReleaseEvent) -> None:
-        # TP ranks of one replica report the same releases under the same ids;
-        # agreeing records collapse, disagreeing ones are a synchronization bug.
+        # TP ranks report the same releases under the same ids: agreeing records
+        # collapse, disagreeing ones are a synchronization bug.
         existing = events.get(event.event_id)
         if existing is not None and existing != event:
             errors.append(

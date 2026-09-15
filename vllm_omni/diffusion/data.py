@@ -1020,9 +1020,8 @@ class OmniDiffusionConfig:
     # Declared send payload keys; empty disables stage-payload sending.
     stage_output_payload_keys: tuple[str, ...] = ()
 
-    # Topology-coordinated session lifecycle: reset/close/eviction ordering is
-    # owned by the orchestrator, so the runner skips its own request-driven
-    # global cleanup and reports releases back instead.
+    # Orchestrator owns reset/close/eviction ordering; the runner reports its
+    # own releases back instead of acting on them.
     coordinated_session_lifecycle: bool = False
 
     # Quantization: str method name, dict config, QuantizationConfig, or None.

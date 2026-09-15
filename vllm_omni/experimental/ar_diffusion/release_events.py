@@ -2,14 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reverse lifecycle path: session releases a worker decided on its own.
 
-An explicit RPC fan-out only covers releases the coordinator asked for. LRU
-eviction, a failed forward and a scheduler-retired request all originate inside
-the runner, so the peer stages that hold state for the same session would never
-hear about them. Runners record those releases here as transport-safe records;
-the coordinator drains and acknowledges them at each request boundary and
-retires the same session on every other participant.
-
-Records carry identity only -- no tensors and no live model objects -- because
+LRU eviction and failed forwards originate inside the runner, where no
+coordinator RPC reaches. Runners record them here; the coordinator drains and
+acknowledges them at each request boundary. Records carry identity only, since
 they cross the collective-RPC boundary.
 """
 
@@ -26,7 +21,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# A release the coordinator itself asked for needs no event: it already knows.
+# A release the coordinator asked for needs no event; it already knows.
 COORDINATED_REASONS = frozenset({"coordinated_reset", "coordinated_close"})
 
 DEFAULT_MAX_PENDING_RELEASE_EVENTS = 256
@@ -36,9 +31,8 @@ DEFAULT_MAX_PENDING_RELEASE_EVENTS = 256
 class ARDiffusionReleaseEvent:
     """One session release a worker performed without being asked.
 
-    ``generation`` is the coordinator-issued token the session was registered
-    under, or ``0`` when the runner never saw one; a stale generation lets the
-    coordinator drop an event that refers to an already-replaced session.
+    ``generation`` is 0 when the runner never saw one; a stale generation lets
+    the coordinator drop an event for an already-replaced session.
     """
 
     event_id: str
@@ -81,11 +75,9 @@ class ARDiffusionReleaseEvent:
 class ARDiffusionReleaseEventLog:
     """Bounded, ack-based outbox of self-initiated session releases.
 
-    Reading is non-destructive: a record survives until it is acknowledged, so
-    an RPC whose reply is lost does not lose the release with it. The log is
-    deliberately small -- the coordinator drains it at every request boundary,
-    so a backlog means synchronization is broken, and ``overflowed`` tells the
-    caller to stop admitting work rather than to keep queueing.
+    Reads are non-destructive, so a lost RPC reply does not lose the release.
+    A backlog means synchronization is broken; ``overflowed`` tells the caller
+    to stop admitting work instead of queueing more.
     """
 
     def __init__(
@@ -106,14 +98,10 @@ class ARDiffusionReleaseEventLog:
         self._suppressed: set[str] = set()
         self._generations: dict[str, int] = {}
 
-    # -- readiness -------------------------------------------------------
-
     def set_ready(self, ready: bool = True) -> None:
-        """Start (or stop) recording. Anything queued while not ready is dropped.
+        """Start (or stop) recording; anything queued while not ready is dropped.
 
-        Startup warmup drives real rollouts through the runner and releases
-        them again; those are not user sessions and must not reach a
-        coordinator that is about to serve its first request.
+        Startup warmup releases real rollouts, but they are not user sessions.
         """
         with self._lock:
             self._ready = bool(ready)
@@ -133,8 +121,6 @@ class ARDiffusionReleaseEventLog:
     def overflowed(self) -> bool:
         return self._overflowed
 
-    # -- generations -----------------------------------------------------
-
     def register_generation(self, session_id: str, generation: int) -> None:
         """Remember the generation a session is currently running under."""
         with self._lock:
@@ -144,14 +130,12 @@ class ARDiffusionReleaseEventLog:
         with self._lock:
             self._generations.pop(str(session_id), None)
 
-    # -- suppression -----------------------------------------------------
-
     @contextmanager
     def coordinated(self, session_id: str) -> Iterator[None]:
         """Mark releases for ``session_id`` as coordinator-driven while inside.
 
-        Without this, the cleanup RPC the coordinator sends would itself
-        produce an event, which the coordinator would then fan out again.
+        Otherwise the coordinator's own cleanup RPC records an event it would
+        then fan out again.
         """
         key = str(session_id)
         with self._lock:
@@ -164,8 +148,6 @@ class ARDiffusionReleaseEventLog:
                 with self._lock:
                     self._suppressed.discard(key)
 
-    # -- recording -------------------------------------------------------
-
     def record(
         self,
         session_id: str,
@@ -175,9 +157,8 @@ class ARDiffusionReleaseEventLog:
     ) -> ARDiffusionReleaseEvent | None:
         """Record one self-initiated release; returns None when suppressed.
 
-        A release whose local cleanup partly failed is still recorded --
-        losing the notification would leave peers holding state for a session
-        this stage no longer has.
+        A partly failed cleanup is still recorded: peers must learn this stage
+        dropped the session.
         """
         key = str(session_id)
         with self._lock:
@@ -186,8 +167,7 @@ class ARDiffusionReleaseEventLog:
             if key in self._suppressed or reason in COORDINATED_REASONS:
                 return None
             if len(self._events) >= self._max_pending:
-                # Dropping the record would silently desynchronize the stages,
-                # so mark the log and let admission stop instead.
+                # Dropping it would silently desynchronize the stages.
                 self._overflowed = True
                 logger.error(
                     "AR-Diffusion release event log is full (%d pending); session=%s reason=%s "
@@ -207,8 +187,6 @@ class ARDiffusionReleaseEventLog:
             )
             self._events[event.event_id] = event
             return event
-
-    # -- draining --------------------------------------------------------
 
     def pending(self) -> list[dict[str, Any]]:
         """Wire records for every unacknowledged release, oldest first."""

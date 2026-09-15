@@ -16,7 +16,8 @@ importing the orchestrator, so it runs directly on CPU.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+import uuid
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -120,6 +121,23 @@ class DiffusionStageLifecycleTopology:
 
 
 @dataclass
+class _PendingRetirement:
+    """One retirement whose remote outcome is not yet confirmed."""
+
+    session_id: str
+    generation: int
+    reason: str
+    # Whether worker cleanup was dispatched: before that, aborting the wait
+    # changed nothing remotely; after it, the outcome is uncertain.
+    dispatched: bool = False
+    confirmed: bool = False
+    operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def describe(self) -> str:
+        return f"{self.session_id!r} generation {self.generation} ({self.reason})"
+
+
+@dataclass
 class _InFlight:
     request_id: str
     session_id: str
@@ -154,9 +172,11 @@ class DiffusionStageLifecycleCoordinator:
         self._gate = asyncio.Lock()
         self._inflight: _InFlight | None = None
         self._blocked_reason: str | None = None
-        # Ids whose close is queued or settling; a begin for one of them would
-        # otherwise be retired by the close waiting behind it.
-        self._close_pending: set[str] = set()
+        # Ids whose close is queued or settling, counted so one operation
+        # finishing cannot clear the fence another still needs.
+        self._close_pending: Counter[str] = Counter()
+        # Retirements whose remote outcome is unknown, keyed by operation id.
+        self._unresolved: dict[str, _PendingRetirement] = {}
 
     @property
     def live_sessions(self) -> dict[str, int]:
@@ -172,8 +192,24 @@ class DiffusionStageLifecycleCoordinator:
     def generation_of(self, session_id: str) -> int | None:
         return self._live.get(str(session_id))
 
-    def clear_block(self) -> None:
-        """Allow admission again after an operator-level recovery."""
+    @property
+    def unresolved_retirements(self) -> tuple[str, ...]:
+        """Human-readable descriptions of retirements awaiting reconciliation."""
+        return tuple(record.describe() for record in self._unresolved.values())
+
+    def clear_block(self, *, force: bool = False) -> None:
+        """Allow admission again once recovery is confirmed.
+
+        Refused while a retirement is still unresolved: an elapsed timer or an
+        empty registry is not evidence that a worker finished its cleanup. Use
+        ``force`` only after the workers were restarted or reconciled by hand.
+        """
+        if self._unresolved and not force:
+            raise SessionLifecycleError(
+                "Cannot clear the coordinated lifecycle block while "
+                f"{len(self._unresolved)} retirement(s) are unconfirmed: " + "; ".join(self.unresolved_retirements)
+            )
+        self._unresolved.clear()
         self._blocked_reason = None
 
     async def _call(self, method: str, stage_ids: Iterable[int], *args: Any) -> dict[int, Any]:
@@ -280,15 +316,8 @@ class DiffusionStageLifecycleCoordinator:
                 self._max_live_sessions,
                 victim,
             )
-            self._retire_locally(victim)
-            results = await self._call("close_ar_diffusion_session", self.topology.state_owning_stage_ids, victim)
-            failures = self._validate_acknowledgements("close_ar_diffusion_session", results)
-            if failures:
-                self._blocked_reason = (
-                    f"registry eviction of session {victim!r} generation {generation} was not "
-                    "confirmed: " + "; ".join(failures)
-                )
-                raise SessionLifecycleError(self._blocked_reason)
+            del generation
+            await self._retire_session(victim, reason="registry_eviction")
 
     async def admit(self, request_id: str, controls: SessionControls) -> int:
         """Order one request against the topology and return its generation.
@@ -317,13 +346,17 @@ class DiffusionStageLifecycleCoordinator:
             coordinated: set[str] = set()
 
             if controls.reset:
-                # The gate already drained older work; retire every participant
-                # once here so no downstream stage repeats it. Once its remote
-                # history is gone the old generation is not restorable, so a
-                # later failure must not put it back.
+                # Phase one: retire the old generation. The gate already drained
+                # older work, and this fans out once so no downstream stage
+                # repeats it. A failure or cancellation here fences the id through
+                # the shared retirement path -- there is no candidate yet to roll
+                # back, and the old session is never restored, because a peer that
+                # did succeed has already discarded its history.
                 if session_id in self._live:
                     await self._retire_session(session_id, reason="coordinated_reset")
                     coordinated.add(session_id)
+                # Phase two: allocate a candidate. Monotonic, so recovery may skip
+                # numbers but never reuses one.
                 self._next_generation += 1
                 candidate = self._next_generation
             else:
@@ -385,14 +418,10 @@ class DiffusionStageLifecycleCoordinator:
         The generation counter is never rewound: a consumed id stays consumed, so
         a retried begin cannot collide with state a participant already took.
         """
-        self._live.pop(session_id, None)
-        results = await self._call("close_ar_diffusion_session", self.topology.state_owning_stage_ids, session_id)
-        failures = self._validate_acknowledgements("close_ar_diffusion_session", results)
-        if failures:
-            self._blocked_reason = (
-                f"rollback of session {session_id!r} generation {generation} was not confirmed: " + "; ".join(failures)
-            )
-            logger.error("Coordinated session lifecycle blocked: %s", self._blocked_reason)
+        try:
+            await self._retire_session(session_id, reason="admission_rollback")
+        except (SessionLifecycleError, asyncio.CancelledError):
+            # Already fenced and recorded by the retirement path.
             return
         logger.info(
             "Rolled back failed admission of session %s generation %d on every participant",
@@ -401,14 +430,58 @@ class DiffusionStageLifecycleCoordinator:
         )
 
     async def _retire_session(self, session_id: str, *, reason: str) -> None:
-        """Clear a session on every state-owning participant and mark it inactive."""
-        self._retire_locally(session_id)
-        await self._fan_out(
-            "close_ar_diffusion_session",
-            session_id,
-            self.topology.state_owning_stage_ids,
+        """Clear a session on every participant, fencing the id unless confirmed.
+
+        The single retirement path for explicit close, reset, request failure,
+        rollback and registry eviction, so no caller can leave an untracked
+        partial cleanup behind. A cancelled await does not prove the remote
+        cleanup stopped, so cancellation is recorded as unresolved before it is
+        allowed to propagate.
+        """
+        key = str(session_id)
+        record = _PendingRetirement(
+            session_id=key,
+            # Read before the registry is mutated, so diagnostics keep the
+            # generation whose state is in question.
+            generation=int(self._live.get(key, 0)),
+            reason=reason,
         )
-        logger.info("Coordinated session %s retired across the topology (%s)", session_id, reason)
+        self._unresolved[record.operation_id] = record
+        self._retire_locally(key)
+        try:
+            record.dispatched = True
+            results = await self._call(
+                "close_ar_diffusion_session",
+                self.topology.state_owning_stage_ids,
+                key,
+            )
+        except BaseException as exc:
+            # Includes cancellation: a timed-out close may still be running on a
+            # worker, so the id stays fenced until something confirms otherwise.
+            self._block(
+                f"retirement of session {key!r} generation {record.generation} ({reason}) was "
+                f"interrupted by {type(exc).__name__} after cleanup was dispatched; its remote "
+                "state is unconfirmed"
+            )
+            raise
+        failures = self._validate_acknowledgements("close_ar_diffusion_session", results)
+        if failures:
+            self._block(
+                f"retirement of session {key!r} generation {record.generation} ({reason}) was not "
+                "confirmed: " + "; ".join(failures)
+            )
+            raise SessionLifecycleError(self._blocked_reason or "retirement failed")
+        record.confirmed = True
+        self._unresolved.pop(record.operation_id, None)
+        logger.info("Coordinated session %s retired across the topology (%s)", key, reason)
+
+    def _block(self, reason: str) -> None:
+        """Fence the topology; the first reason is kept as the root cause."""
+        if self._blocked_reason is None:
+            self._blocked_reason = reason
+        else:
+            self._blocked_reason = f"{self._blocked_reason} | {reason}"
+        logger.error("Coordinated session lifecycle blocked: %s", reason)
 
     def is_inflight(self, request_id: str) -> bool:
         """Whether this request currently holds the topology's admission slot."""
@@ -474,9 +547,19 @@ class DiffusionStageLifecycleCoordinator:
 
         Recorded synchronously, before the close waits on the gate: otherwise a
         begin for the same id could take the gate first and the close behind it
-        would retire that newer rollout instead.
+        would retire that newer rollout instead. Counted, so two concurrent
+        closes for one id each hold their own share of the fence.
         """
-        self._close_pending.add(str(session_id))
+        self._close_pending[str(session_id)] += 1
+
+    def _release_close(self, session_id: str) -> None:
+        """Return this operation's share of the close fence."""
+        key = str(session_id)
+        remaining = self._close_pending.get(key, 0) - 1
+        if remaining > 0:
+            self._close_pending[key] = remaining
+        else:
+            self._close_pending.pop(key, None)
 
     async def close(self, session_id: str) -> None:
         """Explicit close with no inference: clear participants and mark inactive.
@@ -487,23 +570,24 @@ class DiffusionStageLifecycleCoordinator:
         """
         key = str(session_id)
         self.request_close(key)
+        gate_held = False
         try:
-            async with self._gate:
-                if self._blocked_reason is not None:
-                    raise SessionLifecycleError(
-                        f"Cannot confirm close of session {key!r} while the topology is blocked "
-                        f"pending recovery: {self._blocked_reason}"
-                    )
-                try:
-                    await self._retire_session(key, reason="explicit_close")
-                except SessionLifecycleError as exc:
-                    # The registry entry is gone but its remote state is not
-                    # accounted for. Record that, or the next close of this now
-                    # absent session would look like a clean one.
-                    self._blocked_reason = f"close of session {key!r} was not confirmed: {exc}"
-                    raise
+            # Cancellation while queued behind the gate has dispatched nothing, so
+            # it leaves no unresolved record; only the fence share is returned.
+            await self._gate.acquire()
+            gate_held = True
+            if self._blocked_reason is not None:
+                raise SessionLifecycleError(
+                    f"Cannot confirm close of session {key!r} while the topology is blocked "
+                    f"pending recovery: {self._blocked_reason}"
+                )
+            # The retirement path records an unconfirmed or cancelled outcome and
+            # fences the id, so there is nothing extra to do on failure here.
+            await self._retire_session(key, reason="explicit_close")
         finally:
-            self._close_pending.discard(key)
+            self._release_close(key)
+            if gate_held:
+                self._gate.release()
 
     async def invalidate_all(self, *, reason: str) -> None:
         """Drop every live session and clean whatever peer state is reachable.

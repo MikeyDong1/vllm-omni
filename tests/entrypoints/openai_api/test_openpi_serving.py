@@ -766,3 +766,57 @@ def test_a_shared_session_is_only_closed_by_its_last_holder():
 
     assert asyncio.run(serving.release_session("shared")) is True
     assert [call["args"] for call in engine.calls] == [("shared",)]
+
+
+def test_a_cancelled_release_leaves_the_session_unresolved():
+    """An aborted await does not prove the remote close stopped."""
+    entered = asyncio.Event()
+
+    class HangingControlPlane(FakeControlPlane):
+        async def collective_rpc(self, *, method, args=(), timeout=None, **kwargs):
+            self.calls.append({"method": method, "args": args, "timeout": timeout})
+            entered.set()
+            await asyncio.sleep(10)
+
+    engine = HangingControlPlane()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+    serving.acquire_session("A")
+
+    async def scenario():
+        task = asyncio.create_task(serving.release_session("A"))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    # The unresolved close is remembered and the id cannot be taken again.
+    assert serving.unresolved_closes == frozenset({"A"})
+    with pytest.raises(RuntimeError, match="unresolved failed close"):
+        serving.acquire_session("A")
+
+
+def test_a_lifecycle_error_on_the_final_output_is_surfaced_verbatim():
+    """Not replaced by a complaint about the empty payload it arrived with."""
+
+    class FailingEngine(RecordingEngine):
+        def generate(self, *, prompt, request_id, sampling_params_list):
+            async def _generate():
+                yield SimpleNamespace(
+                    error="Engine shut down before session lifecycle cleanup was confirmed",
+                    error_type="session_lifecycle_error",
+                    multimodal_output=None,
+                )
+
+            return _generate()
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=FailingEngine())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(serving.infer({"prompt": "pick"}, session_id="s", reset=True))
+
+    message = str(exc_info.value)
+    assert "session_lifecycle_error" in message
+    assert "lifecycle cleanup was confirmed" in message
+    assert "multimodal_output" not in message

@@ -290,7 +290,9 @@ class ServingRealtimeRobotOpenPI:
         self._closing_sessions.add(key)
         try:
             await self.close_session(key)
-        except Exception:
+        except BaseException:
+            # Cancellation included: an aborted await does not prove the remote
+            # close stopped, so the id stays unresolved rather than reusable.
             self._failed_closes.add(key)
             raise
         finally:

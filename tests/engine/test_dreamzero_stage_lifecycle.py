@@ -377,8 +377,16 @@ def test_a_cleanup_failure_blocks_admission_instead_of_reporting_success():
     with pytest.raises(SessionLifecycleError, match="blocked pending recovery"):
         asyncio.run(coordinator.admit("r2", SessionControls("B", reset=True)))
 
+    # Clearing the block needs evidence: an unconfirmed retirement is still
+    # recorded, so the fence does not lift just because the worker looks healthy.
     workers[ENCODE].fail_close.clear()
-    coordinator.clear_block()
+    assert coordinator.unresolved_retirements
+    with pytest.raises(SessionLifecycleError, match="unconfirmed"):
+        coordinator.clear_block()
+
+    # An operator who reconciled the workers by hand can force it.
+    coordinator.clear_block(force=True)
+    assert coordinator.unresolved_retirements == ()
     asyncio.run(_run_request(coordinator, workers, "r3", "B", reset=True))
     assert coordinator.is_active("B")
 
@@ -1044,3 +1052,289 @@ def test_a_begin_is_refused_while_the_same_id_is_being_closed():
     coordinator.request_close("C")
     with pytest.raises(SessionLifecycleError, match="close in progress"):
         asyncio.run(coordinator.admit("r2", SessionControls("C", reset=True)))
+
+
+# -- cancelled and timed-out retirement -------------------------------------
+
+
+class BarrierRuntime(FakeTopologyRuntime):
+    """Blocks one stage's cleanup on an event so cancellation points are exact."""
+
+    def __init__(self, workers, *, block_stage: int, method: str = "close_ar_diffusion_session"):
+        super().__init__(workers)
+        self.block_stage = block_stage
+        self.method = method
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.completed: list[tuple[str, int]] = []
+
+    async def rpc(self, method, stage_id, args):
+        if method == self.method and stage_id == self.block_stage:
+            self.entered.set()
+            await self.release.wait()
+            result = await super().rpc(method, stage_id, args)
+            self.completed.append((method, stage_id))
+            return result
+        return await super().rpc(method, stage_id, args)
+
+
+def _blocking_coordinator(workers, runtime) -> DiffusionStageLifecycleCoordinator:
+    state_owning = tuple(stage_id for stage_id, worker in sorted(workers.items()) if worker.state_owning)
+    topology = DiffusionStageLifecycleTopology(
+        stage_ids=tuple(sorted(workers)),
+        state_owning_stage_ids=state_owning,
+    )
+    return DiffusionStageLifecycleCoordinator(topology, runtime.rpc)
+
+
+def test_a_cancelled_close_keeps_the_session_fenced():
+    """A cancelled local await does not prove the worker cleanup stopped."""
+    workers = _edd_workers()
+    runtime = BarrierRuntime(workers, block_stage=DENOISE)
+    coordinator = _blocking_coordinator(workers, runtime)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        workers[DENOISE].touch_session("A")
+        await coordinator.complete("r0", success=True)
+
+        close_task = asyncio.create_task(coordinator.close("A"))
+        # Encode cleanup ran; denoise cleanup is dispatched but parked.
+        await runtime.entered.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        # The uncertain close is recorded and the id stays fenced.
+        assert coordinator.blocked_reason is not None
+        assert coordinator.unresolved_retirements
+        with pytest.raises(SessionLifecycleError):
+            await coordinator.admit("r1", SessionControls("A", reset=True))
+
+        # A late worker cleanup landing afterwards cannot have raced a newer
+        # generation, because none was admitted.
+        runtime.release.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert coordinator.live_sessions == {}
+
+
+def test_a_timed_out_close_fences_the_session_like_a_cancelled_one():
+    workers = _edd_workers()
+    runtime = BarrierRuntime(workers, block_stage=DENOISE)
+    coordinator = _blocking_coordinator(workers, runtime)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        await coordinator.complete("r0", success=True)
+
+        # The orchestrator's control path wraps close in wait_for.
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await asyncio.wait_for(coordinator.close("A"), timeout=0.05)
+
+        assert coordinator.blocked_reason is not None
+        assert coordinator.unresolved_retirements
+        runtime.release.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_a_close_while_it_waits_for_the_gate_dispatches_nothing():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        before = list(workers[ENCODE].calls)
+
+        close_task = asyncio.create_task(coordinator.close("B"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        # Nothing was dispatched, so nothing is unresolved and the in-flight
+        # request is untouched.
+        assert coordinator.unresolved_retirements == ()
+        assert coordinator.blocked_reason is None
+        assert workers[ENCODE].calls == before
+        assert coordinator.is_inflight("r0")
+        await coordinator.complete("r0", success=True)
+        # And the id it was going to close is usable again.
+        await coordinator.admit("r1", SessionControls("B", reset=True))
+        await coordinator.complete("r1", success=True)
+
+    asyncio.run(scenario())
+    assert coordinator.is_active("B")
+
+
+def test_two_closes_for_one_id_each_hold_their_own_fence_share():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+
+    async def scenario():
+        coordinator.request_close("A")
+        coordinator.request_close("A")
+        # One operation finishing must not lift the fence the other still needs.
+        coordinator._release_close("A")
+        with pytest.raises(SessionLifecycleError, match="close in progress"):
+            await coordinator.admit("r1", SessionControls("A", reset=True))
+        coordinator._release_close("A")
+        await coordinator.admit("r2", SessionControls("A", reset=True))
+        await coordinator.complete("r2", success=True)
+
+    asyncio.run(scenario())
+    assert coordinator.is_active("A")
+
+
+def test_confirmed_recovery_allows_a_new_generation_but_not_a_continuation():
+    workers = _edd_workers()
+    runtime = BarrierRuntime(workers, block_stage=DENOISE)
+    coordinator = _blocking_coordinator(workers, runtime)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        old_generation = coordinator.generation_of("A")
+        await coordinator.complete("r0", success=True)
+
+        close_task = asyncio.create_task(coordinator.close("A"))
+        await runtime.entered.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        runtime.release.set()
+
+        # Operator-confirmed recovery.
+        coordinator.clear_block(force=True)
+
+        with pytest.raises(SessionNotLiveError):
+            await coordinator.admit("r1", SessionControls("A"))
+        generation = await coordinator.admit("r2", SessionControls("A", reset=True))
+        await coordinator.complete("r2", success=True)
+        return old_generation, generation
+
+    old_generation, generation = asyncio.run(scenario())
+    assert generation > old_generation
+
+
+# -- failed old-generation retirement during reset --------------------------
+
+
+def test_a_failed_reset_retirement_blocks_without_registering_a_candidate():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    registrations_before = sum(
+        1 for worker in workers.values() for call in worker.calls if call[0] == "register_ar_diffusion_generation"
+    )
+
+    # Encode cleanup succeeds, denoise cleanup fails.
+    workers[DENOISE].fail_close.add("A")
+    with pytest.raises(SessionLifecycleError, match="coordinated_reset"):
+        asyncio.run(coordinator.admit("r1", SessionControls("A", reset=True)))
+
+    assert coordinator.blocked_reason is not None
+    assert coordinator.unresolved_retirements
+    assert not coordinator.is_active("A")
+    # No candidate was registered on any worker, so no encode work was ordered.
+    registrations_after = sum(
+        1 for worker in workers.values() for call in worker.calls if call[0] == "register_ar_diffusion_generation"
+    )
+    assert registrations_after == registrations_before
+
+
+def test_neither_begin_nor_continuation_recovers_a_failed_reset_retirement():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    workers[DENOISE].fail_close.add("A")
+    with pytest.raises(SessionLifecycleError):
+        asyncio.run(coordinator.admit("r1", SessionControls("A", reset=True)))
+
+    for controls in (SessionControls("A", reset=True), SessionControls("A")):
+        with pytest.raises(SessionLifecycleError):
+            asyncio.run(coordinator.admit("r2", controls))
+
+    workers[DENOISE].fail_close.clear()
+    coordinator.clear_block(force=True)
+    asyncio.run(_run_request(coordinator, workers, "r3", "A", reset=True))
+    assert coordinator.is_active("A")
+
+
+@pytest.mark.parametrize("failure", ["error_dict", "raised", "cancelled"])
+def test_reset_retirement_failure_shapes_all_fence_the_session(failure):
+    workers = _edd_workers()
+
+    class ShapedRuntime(FakeTopologyRuntime):
+        async def rpc(self, method, stage_id, args):
+            if method == "close_ar_diffusion_session" and stage_id == DENOISE:
+                if failure == "error_dict":
+                    return [[{"supported": False, "error": "denoise refused"}]]
+                if failure == "raised":
+                    raise ConnectionResetError("transport died")
+                raise asyncio.CancelledError()
+            return await super().rpc(method, stage_id, args)
+
+    runtime = ShapedRuntime(workers)
+    coordinator = _blocking_coordinator(workers, runtime)
+
+    async def scenario():
+        await coordinator.admit("r0", SessionControls("A", reset=True))
+        workers[ENCODE].touch_session("A")
+        await coordinator.complete("r0", success=True)
+        expected = asyncio.CancelledError if failure == "cancelled" else SessionLifecycleError
+        with pytest.raises(expected):
+            await coordinator.admit("r1", SessionControls("A", reset=True))
+
+    asyncio.run(scenario())
+    assert coordinator.blocked_reason is not None
+    assert coordinator.unresolved_retirements
+    assert not coordinator.is_active("A")
+
+
+def test_a_failure_after_old_cleanup_still_rolls_back_only_the_candidate():
+    workers = _edd_workers()
+    healthy = workers[DENOISE]
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    old_generation = coordinator.generation_of("A")
+
+    # Old cleanup succeeds; the replacement registration is refused.
+    workers[DENOISE] = RegistrationRefusingWorker(DENOISE)
+    with pytest.raises(SessionLifecycleError, match="Registering generation"):
+        asyncio.run(coordinator.admit("r1", SessionControls("A", reset=True)))
+
+    # The candidate was rolled back and the old generation was not resurrected.
+    assert coordinator.live_sessions == {}
+    assert coordinator.generation_of("A") != old_generation
+    workers[DENOISE] = healthy
+    asyncio.run(_run_request(coordinator, workers, "r2", "A", reset=True))
+    assert coordinator.generation_of("A") > old_generation
+
+
+def test_a_healthy_reset_still_produces_exactly_one_fresh_generation():
+    workers = _edd_workers()
+    coordinator = _coordinator(workers)
+    asyncio.run(_run_request(coordinator, workers, "r0", "A", reset=True))
+    first = coordinator.generation_of("A")
+
+    asyncio.run(_run_request(coordinator, workers, "r1", "A", reset=True))
+
+    second = coordinator.generation_of("A")
+    assert second == first + 1
+    assert coordinator.blocked_reason is None
+    assert coordinator.unresolved_retirements == ()
+    # Exactly one retirement of the old generation, on each state-owning stage.
+    for stage_id in (ENCODE, DENOISE):
+        closes = [call for call in workers[stage_id].calls if call == ("close_ar_diffusion_session", ("A",))]
+        assert len(closes) == 1
+    # And the freshly encoded state downstream survived.
+    assert workers[ENCODE].sessions.get("A") == 1
